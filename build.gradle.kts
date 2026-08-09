@@ -1,5 +1,6 @@
 plugins {
     `java-library`
+    id("me.champeau.jmh") version "0.7.2"
 }
 
 group = "dev.janciara"
@@ -30,4 +31,18 @@ tasks.test {
     }
 }
 
-// JMH (benchmarki) dojdzie w M5 — wtedy dodamy plugin "me.champeau.jmh".
+// Benchmarki (M5): ./gradlew jmh — wyniki laduja w build/results/jmh/results.txt
+// Pojedyncza klasa: ./gradlew jmh -PjmhIncludes=WriteBenchmark
+jmh {
+    warmupIterations.set(2)
+    iterations.set(3)
+    fork.set(1)
+    // Krotsze iteracje niz domyslne 10 s — caly przebieg ma miescic sie w kilku minutach.
+    warmup.set("1s")
+    timeOnIteration.set("2s")
+    // Tryb i jednostke ustala kazdy benchmark u siebie (@BenchmarkMode/@OutputTimeUnit) —
+    // globalne nadpisanie zamienilo by pomiar compaction w cos innego niz deklaruje.
+    if (project.hasProperty("jmhIncludes")) {
+        includes.set(listOf(project.property("jmhIncludes").toString()))
+    }
+}

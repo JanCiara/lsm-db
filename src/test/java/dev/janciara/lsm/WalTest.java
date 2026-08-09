@@ -72,6 +72,77 @@ class WalTest {
         assertArrayEquals(b("b"), got.get(1).key());
     }
 
+    /** Ucina plik o {@code bytes} bajtow — tak wyglada crash w polowie zapisu rekordu. */
+    private static void chopTail(Path file, int bytes) throws IOException {
+        byte[] full = Files.readAllBytes(file);
+        Files.write(file, java.util.Arrays.copyOf(full, full.length - bytes));
+    }
+
+    @Test
+    void truncatedLastRecordIsDroppedInsteadOfBreakingReplay(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (Wal wal = Wal.open(log)) {
+            wal.append(Record.value(b("a"), b("1"), 0));
+            wal.append(Record.value(b("b"), b("2"), 1));
+            wal.append(Record.value(b("c"), b("3"), 2));
+        }
+        long healthyBefore = Files.size(log);
+        chopTail(log, 3); // ostatni rekord urwany w polowie
+
+        List<Record> got = replayAll(log);
+        assertEquals(2, got.size(), "kompletne rekordy odzyskane, niedokonczony pominiety");
+        assertArrayEquals(b("a"), got.get(0).key());
+        assertArrayEquals(b("b"), got.get(1).key());
+        assertTrue(Files.size(log) < healthyBefore, "urwany ogon zostal odciety z pliku");
+    }
+
+    @Test
+    void logStaysUsableAfterRecoveringFromTornTail(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (Wal wal = Wal.open(log)) {
+            wal.append(Record.value(b("a"), b("1"), 0));
+            wal.append(Record.value(b("b"), b("2"), 1));
+        }
+        chopTail(log, 2);
+
+        assertEquals(1, replayAll(log).size());
+        // Po odcieciu ogona log musi dac sie dopisywac dalej — inaczej baza jest martwa na zawsze.
+        try (Wal wal = Wal.open(log)) {
+            wal.append(Record.value(b("c"), b("3"), 2));
+        }
+
+        List<Record> got = replayAll(log);
+        assertEquals(2, got.size());
+        assertArrayEquals(b("a"), got.get(0).key());
+        assertArrayEquals(b("c"), got.get(1).key());
+    }
+
+    @Test
+    void replayReportsHealthyLength(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (Wal wal = Wal.open(log)) {
+            wal.append(Record.value(b("a"), b("1"), 0));
+        }
+        long complete = Files.size(log);
+
+        assertEquals(complete, Wal.replay(log, r -> { }), "caly plik zdrowy");
+
+        chopTail(log, 1);
+        assertEquals(0, Wal.replay(log, r -> { }), "jedyny rekord byl urwany — zdrowe zero bajtow");
+    }
+
+    @Test
+    void bufferedDurabilityStillSurvivesProcessLevelClose(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (Wal wal = Wal.open(log, Wal.Durability.OS_BUFFERED)) {
+            wal.append(Record.value(b("k"), b("v"), 0));
+        }
+
+        List<Record> got = replayAll(log);
+        assertEquals(1, got.size(), "bez fsync, ale dane sa juz w OS — pad procesu ich nie zabiera");
+        assertArrayEquals(b("v"), got.get(0).value());
+    }
+
     @Test
     void truncateClearsHistoryButKeepsLogUsable(@TempDir Path dir) throws IOException {
         Path log = dir.resolve("wal.log");

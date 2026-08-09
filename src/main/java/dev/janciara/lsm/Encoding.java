@@ -26,6 +26,16 @@ import java.util.OptionalLong;
  */
 public final class Encoding {
 
+    /**
+     * Gorny limit dlugosci klucza i wartosci (64 MiB).
+     *
+     * <p>Nie chodzi o oszczedzanie miejsca, tylko o to, zeby uszkodzony varint nie zamienil sie
+     * w {@code new byte[2_000_000_000]}. Bez tej granicy jeden przekrecony bit w pliku konczy sie
+     * OutOfMemoryError zamiast czytelnym bledem — a to roznica miedzy „plik jest zepsuty"
+     * a „proces padl". Limit obowiazuje symetrycznie przy zapisie i odczycie.
+     */
+    public static final int MAX_BLOB_LENGTH = 64 * 1024 * 1024;
+
     private Encoding() {}
 
     // ---- varint -------------------------------------------------------------
@@ -79,15 +89,30 @@ public final class Encoding {
     // ---- length-prefixed blob ----------------------------------------------
 
     public static void writeBlob(OutputStream out, byte[] b) throws IOException {
+        if (b.length > MAX_BLOB_LENGTH) {
+            throw new IllegalArgumentException(
+                    "blob dluzszy niz limit " + MAX_BLOB_LENGTH + " B: " + b.length);
+        }
         writeUVarLong(out, b.length);
         out.write(b);
     }
 
     public static byte[] readBlob(InputStream in) throws IOException {
-        int len = Math.toIntExact(readUVarLong(in));
-        byte[] b = new byte[len];
-        int read = in.readNBytes(b, 0, len);
-        if (read != len) throw new EOFException("truncated blob: wanted " + len + ", got " + read);
+        return readBytes(in, readUVarLong(in), "blob");
+    }
+
+    /**
+     * Czyta {@code len} bajtow, ale najpierw sprawdza, czy ta dlugosc jest w ogole wiarygodna.
+     * Varint moze zdekodowac sie do liczby ujemnej (ustawiony bit 63) albo absurdalnie duzej —
+     * jedno i drugie to uszkodzony plik, a nie powod do alokacji.
+     */
+    private static byte[] readBytes(InputStream in, long len, String what) throws IOException {
+        if (len < 0 || len > MAX_BLOB_LENGTH) {
+            throw new IOException("nierealna dlugosc pola " + what + " (" + len + ") — uszkodzony plik");
+        }
+        byte[] b = new byte[(int) len];
+        int read = in.readNBytes(b, 0, (int) len);
+        if (read != len) throw new EOFException("truncated " + what + ": wanted " + len + ", got " + read);
         return b;
     }
 
@@ -104,9 +129,7 @@ public final class Encoding {
     public static Record readRecord(InputStream in) throws IOException {
         OptionalLong keyLen = readUVarLongOrEof(in);
         if (keyLen.isEmpty()) return null; // czysty koniec strumienia
-        int kLen = Math.toIntExact(keyLen.getAsLong());
-        byte[] key = new byte[kLen];
-        if (in.readNBytes(key, 0, kLen) != kLen) throw new EOFException("truncated key");
+        byte[] key = readBytes(in, keyLen.getAsLong(), "key");
 
         int tomb = in.read();
         if (tomb < 0) throw new EOFException("truncated record (no tombstone flag)");

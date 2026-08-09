@@ -55,46 +55,71 @@ public final class LsmStore implements KVStore {
     private final Wal wal;
     /** Od najstarszej do najnowszej — odczyt przeglada te liste od konca. */
     private final List<SSTable> sstables;
-    private final long flushThresholdBytes;
-    private final int compactionTrigger;
+    private final Options options;
     private long nextSeqNo;
     private long nextTableNumber;
 
     private LsmStore(Path dir, MemTable memtable, Wal wal, List<SSTable> sstables,
-                     long flushThresholdBytes, int compactionTrigger,
-                     long nextSeqNo, long nextTableNumber) {
+                     Options options, long nextSeqNo, long nextTableNumber) {
         this.dir = dir;
         this.memtable = memtable;
         this.wal = wal;
         this.sstables = sstables;
-        this.flushThresholdBytes = flushThresholdBytes;
-        this.compactionTrigger = compactionTrigger;
+        this.options = options;
         this.nextSeqNo = nextSeqNo;
         this.nextTableNumber = nextTableNumber;
     }
 
-    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnymi progami. */
-    public static LsmStore open(Path dir) {
-        return open(dir, DEFAULT_FLUSH_THRESHOLD_BYTES, DEFAULT_COMPACTION_TRIGGER);
+    /**
+     * Nastawy silnika. Zebrane w jeden obiekt, bo inaczej {@code open} mialoby cztery parametry
+     * tego samego typu obok siebie — a takie API zaprasza do przestawienia argumentow.
+     *
+     * @param flushThresholdBytes rozmiar memtable, po ktorym leci zrzut do SSTable
+     * @param compactionTrigger   liczba tabel, po ktorej leci scalanie
+     * @param durability          co ma sie stac z rekordem w WAL, zanim {@code put} wroci
+     */
+    public record Options(long flushThresholdBytes, int compactionTrigger, Wal.Durability durability) {
+
+        public Options {
+            if (flushThresholdBytes <= 0) {
+                throw new IllegalArgumentException("prog zrzutu musi byc dodatni");
+            }
+            if (compactionTrigger < 2) {
+                throw new IllegalArgumentException("scalanie ma sens dopiero od 2 tabel");
+            }
+            if (durability == null) {
+                throw new IllegalArgumentException("durability musi byc podane");
+            }
+        }
+
+        public static Options defaults() {
+            return new Options(DEFAULT_FLUSH_THRESHOLD_BYTES, DEFAULT_COMPACTION_TRIGGER,
+                    Wal.Durability.SYNC);
+        }
+
+        public Options withFlushThresholdBytes(long bytes) {
+            return new Options(bytes, compactionTrigger, durability);
+        }
+
+        public Options withCompactionTrigger(int tables) {
+            return new Options(flushThresholdBytes, tables, durability);
+        }
+
+        public Options withDurability(Wal.Durability durability) {
+            return new Options(flushThresholdBytes, compactionTrigger, durability);
+        }
     }
 
-    /** Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach). */
-    public static LsmStore open(Path dir, long flushThresholdBytes) {
-        return open(dir, flushThresholdBytes, DEFAULT_COMPACTION_TRIGGER);
+    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnymi nastawami. */
+    public static LsmStore open(Path dir) {
+        return open(dir, Options.defaults());
     }
 
     /**
-     * Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach) i wlasna liczba
-     * tabel wyzwalajaca scalanie. Male wartosci wymuszaja czeste zrzuty i scalania — przydatne
-     * w testach i przy zabawie z ksztaltem drzewa.
+     * Otwiera (lub tworzy) sklep w katalogu {@code dir}. Male progi wymuszaja czeste zrzuty
+     * i scalania — przydatne w testach i przy zabawie z ksztaltem drzewa.
      */
-    public static LsmStore open(Path dir, long flushThresholdBytes, int compactionTrigger) {
-        if (flushThresholdBytes <= 0) {
-            throw new IllegalArgumentException("prog zrzutu musi byc dodatni");
-        }
-        if (compactionTrigger < 2) {
-            throw new IllegalArgumentException("scalanie ma sens dopiero od 2 tabel");
-        }
+    public static LsmStore open(Path dir, Options options) {
         try {
             Files.createDirectories(dir);
             deleteLeftoverTempFiles(dir);
@@ -109,14 +134,16 @@ public final class LsmStore implements KVStore {
 
             MemTable memtable = new MemTable();
             long[] seqNo = {maxSeqNo};
+            // Replay sam ucina ewentualny urwany ogon logu, wiec ponizsze open() dopisuje
+            // za ostatnim kompletnym rekordem, a nie za polowka rekordu sprzed crashu.
             Wal.replay(dir.resolve(WAL_FILE), r -> {
                 memtable.put(r);
                 if (r.seqNo() > seqNo[0]) seqNo[0] = r.seqNo();
             });
 
-            Wal wal = Wal.open(dir.resolve(WAL_FILE));
-            return new LsmStore(dir, memtable, wal, sstables, flushThresholdBytes,
-                    compactionTrigger, seqNo[0] + 1, maxTableNumber + 1);
+            Wal wal = Wal.open(dir.resolve(WAL_FILE), options.durability());
+            return new LsmStore(dir, memtable, wal, sstables, options,
+                    seqNo[0] + 1, maxTableNumber + 1);
         } catch (IOException e) {
             throw new UncheckedIOException("nie udalo sie otworzyc sklepu w " + dir, e);
         }
@@ -157,7 +184,7 @@ public final class LsmStore implements KVStore {
         } catch (IOException e) {
             throw new UncheckedIOException("zrzut memtable do SSTable nie powiodl sie", e);
         }
-        if (sstables.size() >= compactionTrigger) compact();
+        if (sstables.size() >= options.compactionTrigger()) compact();
     }
 
     /**
@@ -185,7 +212,7 @@ public final class LsmStore implements KVStore {
             Optional<SSTable> merged = SSTable.compact(nextTablePath(), inputs, /*dropTombstones*/ true);
 
             for (SSTable stale : inputs) { // kolejnosc listy = od najstarszej
-                stale.delete();
+                stale.delete();            // delete() zamyka kanal przed skasowaniem pliku
             }
             SSTable.syncDir(dir);
 
@@ -205,8 +232,12 @@ public final class LsmStore implements KVStore {
     public void close() {
         try {
             wal.close();
+            for (SSTable table : sstables) {
+                table.close(); // kazda tabela trzyma otwarty kanal od momentu otwarcia
+            }
+            sstables.clear();
         } catch (IOException e) {
-            throw new UncheckedIOException("nie udalo sie zamknac WAL", e);
+            throw new UncheckedIOException("nie udalo sie zamknac sklepu", e);
         }
     }
 
@@ -220,7 +251,7 @@ public final class LsmStore implements KVStore {
             throw new UncheckedIOException("zapis do WAL nie powiodl sie", e);
         }
         memtable.put(r);
-        if (memtable.sizeInBytes() >= flushThresholdBytes) flush();
+        if (memtable.sizeInBytes() >= options.flushThresholdBytes()) flush();
     }
 
     /** Sciezka kolejnej tabeli; numer rosnie z kazdym zrzutem i scaleniem. */
@@ -251,8 +282,19 @@ public final class LsmStore implements KVStore {
         files.sort((a, b) -> Long.compare(tableNumber(a), tableNumber(b)));
 
         var tables = new ArrayList<SSTable>(files.size());
-        for (Path f : files) {
-            tables.add(SSTable.open(f));
+        try {
+            for (Path f : files) {
+                tables.add(SSTable.open(f));
+            }
+        } catch (IOException | RuntimeException e) {
+            for (SSTable opened : tables) { // nie zostawiamy otwartych kanalow po nieudanym starcie
+                try {
+                    opened.close();
+                } catch (IOException ignored) {
+                    // i tak lecimy z pierwotnym bledem
+                }
+            }
+            throw e;
         }
         return tables;
     }

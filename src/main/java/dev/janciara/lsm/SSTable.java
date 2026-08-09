@@ -59,11 +59,13 @@ import java.util.PriorityQueue;
  * wtedy podmienia nazwe ({@code ATOMIC_MOVE}). Czytelnik nigdy nie zobaczy polowicznej tabeli —
  * albo pliku nie ma, albo jest kompletny.
  *
- * <p><b>Zaden uchwyt do pliku nie zyje dluzej niz pojedyncza operacja</b> — {@link #get} i
- * {@link Cursor} otwieraja strumien i zamykaja go po sobie. Dzieki temu scalona tabela moze
- * skasowac swoje zrodla nawet na Windows, ktory nie pozwala usunac otwartego pliku.
+ * <p><b>Kanal do pliku jest otwierany raz</b>, przy {@link #open}, i zyje az do {@link #close}.
+ * Wczesniejsza wersja otwierala plik przy kazdym {@code get} — benchmark M5 pokazal, ze samo
+ * {@code open()} kosztowalo wtedy ~85 µs, czyli okolo 99% czasu odczytu. Odczyty ida przez
+ * <i>pozycyjne</i> {@code channel.read(buffer, position)}, ktore nie rusza pozycji kanalu, wiec
+ * kilka kursorow moze czytac ten sam plik naraz bez wzajemnego deptania.
  */
-public final class SSTable {
+public final class SSTable implements Closeable {
 
     /** Magic na poczatku i na samym koncu pliku. */
     static final byte[] MAGIC = {'L', 'S', 'M', 'T'};
@@ -80,6 +82,7 @@ public final class SSTable {
     private static final int TAIL_LEN = Integer.BYTES + MAGIC.length;       // dlugosc stopki + magic
 
     private final Path file;
+    private final FileChannel channel;
     private final long entryCount;
     private final long maxSeqNo;
     private final byte[] minKey;
@@ -90,9 +93,10 @@ public final class SSTable {
     private final List<Block> index;
     private final BloomFilter bloom;
 
-    private SSTable(Path file, long entryCount, long maxSeqNo, byte[] minKey, byte[] maxKey,
-                    long dataEnd, List<Block> index, BloomFilter bloom) {
+    private SSTable(Path file, FileChannel channel, long entryCount, long maxSeqNo,
+                    byte[] minKey, byte[] maxKey, long dataEnd, List<Block> index, BloomFilter bloom) {
         this.file = file;
+        this.channel = channel;
         this.entryCount = entryCount;
         this.maxSeqNo = maxSeqNo;
         this.minKey = minKey;
@@ -233,8 +237,8 @@ public final class SSTable {
 
             Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE);
             syncDir(file.getParent());
-            return Optional.of(new SSTable(file, entryCount, maxSeqNo, minKey, prevKey,
-                    indexOffset, List.copyOf(blocks), bloom));
+            return Optional.of(new SSTable(file, FileChannel.open(file, StandardOpenOption.READ),
+                    entryCount, maxSeqNo, minKey, prevKey, indexOffset, List.copyOf(blocks), bloom));
         }
 
         /** Po {@link #finish} nic nie robi; w przeciwnym razie kasuje niedokonczony plik tymczasowy. */
@@ -355,7 +359,8 @@ public final class SSTable {
             throw new IOException("plik za krotki jak na SSTable: " + file);
         }
 
-        try (FileChannel ch = FileChannel.open(file, StandardOpenOption.READ)) {
+        FileChannel ch = FileChannel.open(file, StandardOpenOption.READ);
+        try {
             byte[] header = readAt(ch, 0, HEADER_LEN);
             if (!Arrays.equals(MAGIC, Arrays.copyOf(header, MAGIC.length))) {
                 throw new IOException("to nie jest SSTable (zly magic): " + file);
@@ -390,7 +395,10 @@ public final class SSTable {
                     readAt(ch, indexOffset, Math.toIntExact(footerStart - indexOffset)));
             List<Block> index = readIndex(meta, indexOffset);
             BloomFilter bloom = BloomFilter.readFrom(meta);
-            return new SSTable(file, entryCount, maxSeqNo, minKey, maxKey, indexOffset, index, bloom);
+            return new SSTable(file, ch, entryCount, maxSeqNo, minKey, maxKey, indexOffset, index, bloom);
+        } catch (IOException | RuntimeException e) {
+            ch.close(); // kanal zyje dalej tylko wtedy, gdy tabela naprawde sie otworzyla
+            throw e;
         }
     }
 
@@ -483,13 +491,12 @@ public final class SSTable {
     }
 
     private Cursor cursorOver(long from, long to) throws IOException {
-        InputStream in = dataStream(from, to);
+        Cursor cursor = new Cursor(dataStream(from, to));
         try {
-            Cursor cursor = new Cursor(in);
             cursor.advance();
             return cursor;
         } catch (IOException e) {
-            in.close();
+            cursor.close();
             throw e;
         }
     }
@@ -523,8 +530,15 @@ public final class SSTable {
         }
     }
 
-    /** Kasuje plik tabeli. Uwaga na kolejnosc — patrz {@code LsmStore#compact}. */
+    /** Zamyka kanal do pliku. Tabela przestaje nadawac sie do odczytu. */
+    @Override
+    public void close() throws IOException {
+        channel.close();
+    }
+
+    /** Zamyka i kasuje plik tabeli. Uwaga na kolejnosc — patrz {@code LsmStore#compact}. */
     public void delete() throws IOException {
+        close();
         Files.delete(file);
     }
 
@@ -563,15 +577,8 @@ public final class SSTable {
     // ---- wewnetrzne ----------------------------------------------------------
 
     /** Strumien obejmujacy dokladnie zakres bajtow {@code [from, to)} pliku. */
-    private InputStream dataStream(long from, long to) throws IOException {
-        InputStream raw = Files.newInputStream(file);
-        try {
-            raw.skipNBytes(from);
-            return new BufferedInputStream(new BoundedInputStream(raw, to - from));
-        } catch (IOException e) {
-            raw.close();
-            throw e;
-        }
+    private InputStream dataStream(long from, long to) {
+        return new BufferedInputStream(new ChannelRangeInputStream(channel, from, to));
     }
 
     private static byte[] readAt(FileChannel ch, long position, int length) throws IOException {
@@ -628,37 +635,45 @@ public final class SSTable {
     }
 
     /**
-     * Ogranicza odczyt do zadanej liczby bajtow — dzieki temu kursor po bloku konczy sie dokladnie
-     * na jego granicy i nigdy nie zaczyna dekodowac sekcji indeksu jako rekordu.
+     * Czyta z kanalu wylacznie zakres {@code [from, to)}, trzymajac wlasna pozycje.
+     *
+     * <p>Dwie rzeczy naraz: (1) ograniczenie do zakresu sprawia, ze kursor po bloku konczy sie
+     * dokladnie na jego granicy i nigdy nie zaczyna dekodowac sekcji indeksu jako rekordu;
+     * (2) uzycie <i>pozycyjnego</i> {@code read(buf, position)} nie rusza pozycji wspoldzielonego
+     * kanalu, wiec kilka strumieni moze czytac ten sam plik niezaleznie.
      */
-    private static final class BoundedInputStream extends FilterInputStream {
+    private static final class ChannelRangeInputStream extends InputStream {
 
+        private final FileChannel channel;
+        private long position;
         private long remaining;
 
-        BoundedInputStream(InputStream in, long limit) {
-            super(in);
-            this.remaining = limit;
+        ChannelRangeInputStream(FileChannel channel, long from, long to) {
+            this.channel = channel;
+            this.position = from;
+            this.remaining = Math.max(0, to - from);
         }
 
         @Override
         public int read() throws IOException {
-            if (remaining <= 0) return -1;
-            int b = in.read();
-            if (b >= 0) remaining--;
-            return b;
+            byte[] one = new byte[1];
+            return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
         }
 
         @Override
         public int read(byte[] b, int off, int len) throws IOException {
             if (remaining <= 0) return -1;
-            int read = in.read(b, off, (int) Math.min(len, remaining));
-            if (read > 0) remaining -= read;
+            ByteBuffer buf = ByteBuffer.wrap(b, off, (int) Math.min(len, remaining));
+            int read = channel.read(buf, position);
+            if (read <= 0) return -1;
+            position += read;
+            remaining -= read;
             return read;
         }
 
         @Override
-        public int available() throws IOException {
-            return (int) Math.min(in.available(), remaining);
+        public int available() {
+            return (int) Math.min(Integer.MAX_VALUE, remaining);
         }
     }
 }

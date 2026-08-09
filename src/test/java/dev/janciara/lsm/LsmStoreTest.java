@@ -3,6 +3,7 @@ package dev.janciara.lsm;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.IOException;
@@ -19,6 +20,10 @@ class LsmStoreTest {
 
     private static byte[] b(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    private static LsmStore.Options options() {
+        return LsmStore.Options.defaults();
     }
 
     private static long walSize(Path dir) throws IOException {
@@ -216,7 +221,7 @@ class LsmStoreTest {
     @Test
     void memtableIsFlushedAutomaticallyAfterThreshold(@TempDir Path dir) throws IOException {
         // Prog dobrany tak, zeby zmiescilo sie kilka wpisow, a nie kilka tysiecy.
-        try (LsmStore db = LsmStore.open(dir, 200)) {
+        try (LsmStore db = LsmStore.open(dir, options().withFlushThresholdBytes(200))) {
             db.put(b("k0"), b("v0"));
             assertEquals(0, db.sstableCount());
 
@@ -277,7 +282,7 @@ class LsmStoreTest {
 
     @Test
     void compactionRunsAutomaticallyAfterTriggerCount(@TempDir Path dir) throws IOException {
-        try (LsmStore db = LsmStore.open(dir, LsmStore.DEFAULT_FLUSH_THRESHOLD_BYTES, 3)) {
+        try (LsmStore db = LsmStore.open(dir, options().withCompactionTrigger(3))) {
             db.put(b("a"), b("1"));
             db.flush();
             db.put(b("b"), b("2"));
@@ -308,8 +313,10 @@ class LsmStoreTest {
 
         List<Path> files = sstFiles(dir);
         assertEquals(1, files.size());
-        assertEquals(1, SSTable.open(files.get(0)).entryCount(),
-                "piec wersji klucza sprowadzone do jednej — dopiero to odzyskuje miejsce");
+        try (SSTable table = SSTable.open(files.get(0))) {
+            assertEquals(1, table.entryCount(),
+                    "piec wersji klucza sprowadzone do jednej — dopiero to odzyskuje miejsce");
+        }
     }
 
     @Test
@@ -328,9 +335,11 @@ class LsmStoreTest {
             assertArrayEquals(b("v"), db.get(b("zostaje")).orElseThrow());
         }
 
-        List<Record> onDisk = SSTable.open(sstFiles(dir).get(0)).readAll();
-        assertEquals(1, onDisk.size(), "ani wartosc, ani tombstone nie zajmuja juz miejsca");
-        assertArrayEquals(b("zostaje"), onDisk.get(0).key());
+        try (SSTable table = SSTable.open(sstFiles(dir).get(0))) {
+            List<Record> onDisk = table.readAll();
+            assertEquals(1, onDisk.size(), "ani wartosc, ani tombstone nie zajmuja juz miejsca");
+            assertArrayEquals(b("zostaje"), onDisk.get(0).key());
+        }
     }
 
     @Test
@@ -403,7 +412,7 @@ class LsmStoreTest {
 
     @Test
     void mixedWorkloadStaysCorrectAcrossFlushesAndCompaction(@TempDir Path dir) {
-        try (LsmStore db = LsmStore.open(dir, LsmStore.DEFAULT_FLUSH_THRESHOLD_BYTES, 3)) {
+        try (LsmStore db = LsmStore.open(dir, options().withCompactionTrigger(3))) {
             for (int i = 0; i < 30; i++) {
                 db.put(b("k" + i), b("v" + i));
                 if (i % 5 == 4) db.flush();
@@ -463,6 +472,51 @@ class LsmStoreTest {
             assertArrayEquals(b("v"), db.get(b("k")).orElseThrow(),
                     "bez tombstone'a wraca stara wartosc — dlatego compact() kasuje od najstarszej");
         }
+    }
+
+    // ---- M5: odpornosc i nastawy -------------------------------------------
+
+    @Test
+    void storeOpensAfterCrashInTheMiddleOfAWrite(@TempDir Path dir) throws IOException {
+        try (LsmStore db = LsmStore.open(dir)) {
+            db.put(b("a"), b("1"));
+            db.put(b("b"), b("2"));
+        }
+        // Crash w polowie trzeciego zapisu: ostatni rekord w logu jest niekompletny.
+        Path log = dir.resolve("wal.log");
+        byte[] full = Files.readAllBytes(log);
+        Files.write(log, java.util.Arrays.copyOf(full, full.length - 2));
+
+        try (LsmStore db = LsmStore.open(dir)) {
+            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "potwierdzone zapisy przetrwaly");
+            assertTrue(db.get(b("b")).isEmpty(), "niedokonczony zapis nie zostal nigdy potwierdzony");
+
+            db.put(b("c"), b("3")); // sklep musi byc dalej zdatny do uzytku
+            assertArrayEquals(b("3"), db.get(b("c")).orElseThrow());
+        }
+        try (LsmStore db = LsmStore.open(dir)) {
+            assertArrayEquals(b("3"), db.get(b("c")).orElseThrow());
+        }
+    }
+
+    @Test
+    void bufferedDurabilityKeepsSameSemanticsForCleanClose(@TempDir Path dir) {
+        LsmStore.Options buffered = options().withDurability(Wal.Durability.OS_BUFFERED);
+        try (LsmStore db = LsmStore.open(dir, buffered)) {
+            db.put(b("k"), b("v"));
+            db.delete(b("usuniety"));
+        }
+        try (LsmStore db = LsmStore.open(dir, buffered)) {
+            assertArrayEquals(b("v"), db.get(b("k")).orElseThrow());
+            assertTrue(db.get(b("usuniety")).isEmpty());
+        }
+    }
+
+    @Test
+    void optionsRejectNonsense() {
+        assertThrows(IllegalArgumentException.class, () -> options().withFlushThresholdBytes(0));
+        assertThrows(IllegalArgumentException.class, () -> options().withCompactionTrigger(1));
+        assertThrows(IllegalArgumentException.class, () -> options().withDurability(null));
     }
 
     @Test

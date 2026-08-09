@@ -14,21 +14,52 @@ import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class SSTableTest {
+
+    /**
+     * Kazda otwarta tabela trzyma kanal do pliku az do {@code close()}. Testy tworza je hurtowo,
+     * wiec zbieramy je tutaj i zamykamy po kazdym tescie — zamiast rozsiewac try-with-resources.
+     */
+    private final List<SSTable> opened = new ArrayList<>();
+
+    @AfterEach
+    void closeOpenedTables() throws IOException {
+        for (SSTable t : opened) {
+            t.close(); // idempotentne, wiec tabele skasowane w tescie tez sa tu bezpieczne
+        }
+    }
+
+    private SSTable track(SSTable table) {
+        opened.add(table);
+        return table;
+    }
+
+    private SSTable open(Path file) throws IOException {
+        return track(SSTable.open(file));
+    }
+
+    private Optional<SSTable> compact(Path target, List<SSTable> inputs, boolean dropTombstones)
+            throws IOException {
+        Optional<SSTable> merged = SSTable.compact(target, inputs, dropTombstones);
+        merged.ifPresent(this::track);
+        return merged;
+    }
 
     private static byte[] b(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
     }
 
     /** Zapis przez memtable, zeby wejscie bylo posortowane tak jak w prawdziwym zrzucie. */
-    private static SSTable writeTable(Path file, Record... records) throws IOException {
+    private SSTable writeTable(Path file, Record... records) throws IOException {
         var mt = new MemTable();
         for (Record r : records) mt.put(r);
-        return SSTable.write(file, mt.snapshot());
+        return track(SSTable.write(file, mt.snapshot()));
     }
 
     @Test
@@ -74,7 +105,7 @@ class SSTableTest {
                 Record.value(b("m"), b("2"), 9),
                 Record.value(b("z"), b("3"), 5));
 
-        SSTable reopened = SSTable.open(file);
+        SSTable reopened = open(file);
         assertEquals(3, reopened.entryCount());
         assertEquals(9, reopened.maxSeqNo(), "stopka pamieta najwyzszy seqNo, nie ostatni zapisany");
         assertArrayEquals(b("a"), reopened.minKey());
@@ -227,7 +258,7 @@ class SSTableTest {
                 Record.value(b("b"), b("nowe-b"), 2),
                 Record.value(b("c"), b("nowe-c"), 3));
 
-        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
 
         List<Record> all = merged.readAll();
         assertEquals(3, all.size(), "wspolny klucz zostaje raz");
@@ -245,7 +276,7 @@ class SSTableTest {
         SSTable t2 = writeTable(dir.resolve("2.sst"), Record.value(b("c"), b("3"), 3),
                 Record.value(b("e"), b("5"), 4));
 
-        SSTable merged = SSTable.compact(dir.resolve("3.sst"), List.of(t0, t1, t2), true).orElseThrow();
+        SSTable merged = compact(dir.resolve("3.sst"), List.of(t0, t1, t2), true).orElseThrow();
 
         List<byte[]> keys = merged.readAll().stream().map(Record::key).toList();
         assertEquals(5, keys.size());
@@ -263,7 +294,7 @@ class SSTableTest {
                 Record.value(b("znika"), b("v"), 1));
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("znika"), 2));
 
-        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
 
         List<Record> all = merged.readAll();
         assertEquals(1, all.size(), "i wartosc, i przykrywajacy ja tombstone znikaja");
@@ -276,7 +307,7 @@ class SSTableTest {
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("k"), 1));
 
         // dropTombstones=false: pod spodem moze lezec starsza tabela, ktorej tombstone wciaz pilnuje
-        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), false).orElseThrow();
+        SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), false).orElseThrow();
 
         List<Record> all = merged.readAll();
         assertEquals(1, all.size());
@@ -289,7 +320,7 @@ class SSTableTest {
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("k"), 1));
 
         Path target = dir.resolve("2.sst");
-        assertTrue(SSTable.compact(target, List.of(older, newer), true).isEmpty());
+        assertTrue(compact(target, List.of(older, newer), true).isEmpty());
         assertFalse(Files.exists(target), "pusta tabela nie zostawia pliku");
         assertFalse(Files.exists(dir.resolve("2.sst.tmp")));
     }
@@ -297,12 +328,12 @@ class SSTableTest {
     // ---- M4: indeks blokowy i filtr Blooma ---------------------------------
 
     /** Tabela wyraznie wieksza niz jeden blok: 200 rekordow po ~120 B to ~24 KiB. */
-    private static SSTable multiBlockTable(Path file) throws IOException {
+    private SSTable multiBlockTable(Path file) throws IOException {
         var mt = new MemTable();
         for (int i = 0; i < 200; i++) {
             mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
         }
-        return SSTable.write(file, mt.snapshot());
+        return track(SSTable.write(file, mt.snapshot()));
     }
 
     @Test
@@ -310,14 +341,14 @@ class SSTableTest {
         SSTable t = multiBlockTable(dir.resolve("t.sst"));
 
         assertTrue(t.blockCount() > 1, "24 KiB danych nie miesci sie w jednym 4 KiB bloku");
-        assertEquals(t.blockCount(), SSTable.open(dir.resolve("t.sst")).blockCount(),
+        assertEquals(t.blockCount(), open(dir.resolve("t.sst")).blockCount(),
                 "indeks odtworzony ze stopki bez zmian");
     }
 
     @Test
     void everyKeyIsFoundThroughTheIndex(@TempDir Path dir) throws IOException {
         multiBlockTable(dir.resolve("t.sst"));
-        SSTable t = SSTable.open(dir.resolve("t.sst")); // czytamy przez indeks z pliku, nie z pamieci writera
+        SSTable t = open(dir.resolve("t.sst")); // czytamy przez indeks z pliku, nie z pamieci writera
 
         for (int i = 0; i < 200; i++) {
             String key = String.format("klucz:%04d", i);
@@ -333,7 +364,7 @@ class SSTableTest {
         for (int i = 0; i < 200; i += 2) { // same parzyste
             mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
         }
-        SSTable t = SSTable.open(SSTable.write(dir.resolve("t.sst"), mt.snapshot()).path());
+        SSTable t = open(track(SSTable.write(dir.resolve("t.sst"), mt.snapshot())).path());
 
         for (int i = 1; i < 200; i += 2) { // pytamy o nieparzyste
             String key = String.format("klucz:%04d", i);
@@ -346,10 +377,10 @@ class SSTableTest {
         SSTable older = multiBlockTable(dir.resolve("0.sst"));
         var mt = new MemTable();
         mt.put(Record.value(b("klucz:0000"), b("nadpisane"), 1000));
-        SSTable newer = SSTable.write(dir.resolve("1.sst"), mt.snapshot());
+        SSTable newer = track(SSTable.write(dir.resolve("1.sst"), mt.snapshot()));
 
-        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
-        SSTable reopened = SSTable.open(merged.path());
+        SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        SSTable reopened = open(merged.path());
 
         assertTrue(reopened.blockCount() > 1, "scalona tabela tez ma indeks");
         assertEquals(200, reopened.entryCount());
@@ -360,7 +391,7 @@ class SSTableTest {
     @Test
     void bloomRejectsMissingKeysWithoutTouchingDisk(@TempDir Path dir) throws IOException {
         multiBlockTable(dir.resolve("t.sst"));
-        SSTable t = SSTable.open(dir.resolve("t.sst"));
+        SSTable t = open(dir.resolve("t.sst"));
 
         int survived = 0;
         for (int i = 0; i < 1000; i++) {
@@ -388,7 +419,7 @@ class SSTableTest {
         SSTable older = writeTable(dir.resolve("0.sst"), Record.value(b("a"), b("1"), 0));
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.value(b("b"), b("2"), 1));
 
-        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
         // Zaden uchwyt do pliku nie przetrwal scalania — inaczej Windows odmowilby kasowania.
         older.delete();
         newer.delete();

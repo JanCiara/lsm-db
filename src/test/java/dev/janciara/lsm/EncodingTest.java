@@ -1,14 +1,17 @@
 package dev.janciara.lsm;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Random;
 
@@ -17,6 +20,35 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class EncodingTest {
+
+    @Test
+    void absurdBlobLengthIsRejectedAsCorruption() {
+        // uvarint kodujacy 2^60 jako dlugosc klucza — bez walidacji skonczyloby sie
+        // NegativeArraySizeException albo probą alokacji gigabajtow
+        var bogus = new ByteArrayOutputStream();
+        assertDoesNotThrow(() -> Encoding.writeUVarLong(bogus, 1L << 60));
+
+        var in = new ByteArrayInputStream(bogus.toByteArray());
+        IOException e = assertThrows(IOException.class, () -> Encoding.readRecord(in));
+        assertTrue(e.getMessage().contains("nierealna dlugosc"), e.getMessage());
+    }
+
+    @Test
+    void negativeBlobLengthIsRejectedAsCorruption() {
+        var bogus = new ByteArrayOutputStream();
+        assertDoesNotThrow(() -> Encoding.writeUVarLong(bogus, -1L)); // unsigned max
+
+        var in = new ByteArrayInputStream(bogus.toByteArray());
+        assertThrows(IOException.class, () -> Encoding.readRecord(in));
+    }
+
+    @Test
+    void writingOversizedBlobIsRejectedUpFront() {
+        // Symetria: skoro odczyt odrzuca takie dlugosci, zapis nie moze ich produkowac.
+        byte[] tooBig = new byte[Encoding.MAX_BLOB_LENGTH + 1];
+        assertThrows(IllegalArgumentException.class,
+                () -> Encoding.writeBlob(OutputStream.nullOutputStream(), tooBig));
+    }
 
     private static byte[] b(String s) {
         return s.getBytes(StandardCharsets.UTF_8);
