@@ -2,53 +2,101 @@ package dev.janciara.lsm;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Optional;
 
 /**
- * Pierwsza konkretna implementacja {@link KVStore} (M1): WAL + memtable.
+ * Implementacja {@link KVStore} (M2): WAL + memtable + niemutowalne SSTable na dysku.
  *
- * <p>Sciezka zapisu: kazdy {@code put}/{@code delete} najpierw dopisuje rekord do {@link Wal}
- * (trwalosc), a dopiero potem uwidacznia go w {@link MemTable} (widocznosc). To kolejnosc
- * „write-ahead" — gdy proces padnie po zapisie do WAL a przed czymkolwiek innym, {@link #open}
- * i tak odtworzy ten zapis.
+ * <p><b>Sciezka zapisu.</b> Kazdy {@code put}/{@code delete} najpierw dopisuje rekord do
+ * {@link Wal} (trwalosc), a dopiero potem uwidacznia go w {@link MemTable} (widocznosc). Gdy
+ * memtable przekroczy prog rozmiaru, jej zawartosc laduje w nowej {@link SSTable}, memtable
+ * startuje pusta, a WAL jest zerowany.
  *
- * <p>Przy otwarciu odtwarzamy log do memtable i ustawiamy licznik {@code seqNo} na
- * {@code max(seqNo w logu) + 1}, zeby nowe zapisy mialy wyzszy numer niz cokolwiek historycznego.
+ * <p><b>Sciezka odczytu</b> idzie od najswiezszej warstwy do najstarszej: memtable, potem SSTable
+ * od najnowszej do najstarszej. Pierwsze trafienie wygrywa — nie trzeba porownywac {@code seqNo},
+ * bo kazdy zrzut zawiera rekordy nowsze niz wszystko, co zrzucono wczesniej. Znaleziony rekord
+ * moze byc tombstone; wtedy klucz jest dla swiata usuniety, mimo ze starsza tabela ma dla niego
+ * wartosc. To wlasnie dlatego usuniecie moze byc zapisem.
  *
- * <p>W M1 wszystkie dane mieszcza sie w pamieci (brak zrzutu do SSTable — to M2), a WAL rosnie
- * bez ograniczen. Klasa nie jest bezpieczna watkowo — zaklada uzycie jednowatkowe.
+ * <p><b>Odtwarzanie po restarcie.</b> {@link #open} wczytuje metadane wszystkich plikow
+ * {@code sst-*.sst}, odtwarza WAL do memtable i ustawia licznik {@code seqNo} na
+ * {@code max(seqNo w SSTable i w logu) + 1}. Crash pomiedzy zapisem SSTable a wyczyszczeniem WAL
+ * jest nieszkodliwy: replay wroci rekordami, ktore juz sa na dysku, a te trafia do memtable —
+ * czyli do warstwy wygrywajacej. Zaden odczyt nie zobaczy przez to starszej wartosci.
+ *
+ * <p>Compaction (scalanie i usuwanie martwych wpisow) to M3 — na razie liczba tabel rosnie,
+ * a odczyt chybiony przeglada je wszystkie. Klasa nie jest bezpieczna watkowo.
  */
 public final class LsmStore implements KVStore {
 
     private static final String WAL_FILE = "wal.log";
+    private static final String SST_PREFIX = "sst-";
+    private static final String SST_SUFFIX = ".sst";
+    private static final String TMP_SUFFIX = ".tmp";
 
+    /** Domyslny prog zrzutu memtable na dysk. */
+    public static final long DEFAULT_FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024;
+
+    private final Path dir;
     private final MemTable memtable;
     private final Wal wal;
+    /** Od najstarszej do najnowszej — odczyt przeglada te liste od konca. */
+    private final List<SSTable> sstables;
+    private final long flushThresholdBytes;
     private long nextSeqNo;
+    private long nextTableNumber;
 
-    private LsmStore(MemTable memtable, Wal wal, long nextSeqNo) {
+    private LsmStore(Path dir, MemTable memtable, Wal wal, List<SSTable> sstables,
+                     long flushThresholdBytes, long nextSeqNo, long nextTableNumber) {
+        this.dir = dir;
         this.memtable = memtable;
         this.wal = wal;
+        this.sstables = sstables;
+        this.flushThresholdBytes = flushThresholdBytes;
         this.nextSeqNo = nextSeqNo;
+        this.nextTableNumber = nextTableNumber;
     }
 
-    /** Otwiera (lub tworzy) sklep w katalogu {@code dir}, odtwarzajac stan z WAL. */
+    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnym progiem zrzutu. */
     public static LsmStore open(Path dir) {
+        return open(dir, DEFAULT_FLUSH_THRESHOLD_BYTES);
+    }
+
+    /**
+     * Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach). Male wartosci
+     * wymuszaja czeste zrzuty — przydatne w testach i przy zabawie z ksztaltem drzewa.
+     */
+    public static LsmStore open(Path dir, long flushThresholdBytes) {
+        if (flushThresholdBytes <= 0) {
+            throw new IllegalArgumentException("prog zrzutu musi byc dodatni");
+        }
         try {
             Files.createDirectories(dir);
-            Path walPath = dir.resolve(WAL_FILE);
+            deleteLeftoverTempFiles(dir);
+
+            List<SSTable> sstables = openSSTables(dir);
+            long maxSeqNo = -1L; // -1 => brak historii => nextSeqNo startuje od 0
+            long maxTableNumber = -1L;
+            for (SSTable t : sstables) {
+                maxSeqNo = Math.max(maxSeqNo, t.maxSeqNo());
+                maxTableNumber = Math.max(maxTableNumber, tableNumber(t.path()));
+            }
 
             MemTable memtable = new MemTable();
-            long[] maxSeq = {-1L}; // -1 => pusty log => nextSeqNo startuje od 0
-            Wal.replay(walPath, r -> {
+            long[] seqNo = {maxSeqNo};
+            Wal.replay(dir.resolve(WAL_FILE), r -> {
                 memtable.put(r);
-                if (r.seqNo() > maxSeq[0]) maxSeq[0] = r.seqNo();
+                if (r.seqNo() > seqNo[0]) seqNo[0] = r.seqNo();
             });
 
-            Wal wal = Wal.open(walPath);
-            return new LsmStore(memtable, wal, maxSeq[0] + 1);
+            Wal wal = Wal.open(dir.resolve(WAL_FILE));
+            return new LsmStore(dir, memtable, wal, sstables, flushThresholdBytes,
+                    seqNo[0] + 1, maxTableNumber + 1);
         } catch (IOException e) {
             throw new UncheckedIOException("nie udalo sie otworzyc sklepu w " + dir, e);
         }
@@ -56,23 +104,46 @@ public final class LsmStore implements KVStore {
 
     @Override
     public void put(byte[] key, byte[] value) {
-        Record r = Record.value(key.clone(), value.clone(), nextSeqNo++);
-        writeAhead(r);
+        writeAhead(Record.value(key.clone(), value.clone(), nextSeqNo++));
     }
 
     @Override
     public void delete(byte[] key) {
-        Record r = Record.tombstone(key.clone(), nextSeqNo++);
-        writeAhead(r);
+        writeAhead(Record.tombstone(key.clone(), nextSeqNo++));
     }
 
     @Override
     public Optional<byte[]> get(byte[] key) {
         Optional<Record> found = memtable.get(key);
+        if (found.isEmpty()) found = searchSSTables(key);
         if (found.isEmpty()) return Optional.empty();
+
         Record r = found.get();
         if (r.tombstone()) return Optional.empty();
         return Optional.of(r.value().clone());
+    }
+
+    /**
+     * Zrzuca memtable do nowej SSTable i zeruje WAL. Pusta memtable = no-op (nie robimy pustych
+     * plikow). Normalnie wola sie samo po przekroczeniu progu; recznie przydaje sie w testach
+     * i gdy chcemy zamknac sklep z „czystym" logiem.
+     */
+    public void flush() {
+        if (memtable.isEmpty()) return;
+        try {
+            Path file = dir.resolve(String.format("%s%06d%s", SST_PREFIX, nextTableNumber, SST_SUFFIX));
+            sstables.add(SSTable.write(file, memtable.snapshot()));
+            nextTableNumber++;
+            memtable.clear();
+            wal.truncate();
+        } catch (IOException e) {
+            throw new UncheckedIOException("zrzut memtable do SSTable nie powiodl sie", e);
+        }
+    }
+
+    /** Liczba SSTable na dysku — podglad stanu silnika (testy, przyszle metryki). */
+    public int sstableCount() {
+        return sstables.size();
     }
 
     @Override
@@ -84,7 +155,9 @@ public final class LsmStore implements KVStore {
         }
     }
 
-    /** WAL najpierw (trwalosc), memtable potem (widocznosc). */
+    // ---- wewnetrzne ----------------------------------------------------------
+
+    /** WAL najpierw (trwalosc), memtable potem (widocznosc), na koncu ewentualny zrzut. */
     private void writeAhead(Record r) {
         try {
             wal.append(r);
@@ -92,5 +165,59 @@ public final class LsmStore implements KVStore {
             throw new UncheckedIOException("zapis do WAL nie powiodl sie", e);
         }
         memtable.put(r);
+        if (memtable.sizeInBytes() >= flushThresholdBytes) flush();
+    }
+
+    /** Przeglada tabele od najnowszej — pierwsze trafienie jest z definicji najswiezsze. */
+    private Optional<Record> searchSSTables(byte[] key) {
+        for (int i = sstables.size() - 1; i >= 0; i--) {
+            SSTable table = sstables.get(i);
+            try {
+                Optional<Record> found = table.get(key);
+                if (found.isPresent()) return found;
+            } catch (IOException e) {
+                throw new UncheckedIOException("nie udalo sie odczytac " + table.path(), e);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /** Wczytuje metadane tabel z katalogu, posortowane rosnaco po numerze (czyli od najstarszej). */
+    private static List<SSTable> openSSTables(Path dir) throws IOException {
+        var files = new ArrayList<Path>();
+        try (DirectoryStream<Path> ls = Files.newDirectoryStream(dir, SST_PREFIX + "*" + SST_SUFFIX)) {
+            ls.forEach(files::add);
+        }
+        files.sort((a, b) -> Long.compare(tableNumber(a), tableNumber(b)));
+
+        var tables = new ArrayList<SSTable>(files.size());
+        for (Path f : files) {
+            tables.add(SSTable.open(f));
+        }
+        return tables;
+    }
+
+    /**
+     * Numer z nazwy {@code sst-000007.sst}. Rosnie z kazdym zrzutem, wiec porzadek nazw = porzadek
+     * swiezosci danych. Nazwa nie pasujaca do wzorca konczy otwarcie bledem, zamiast po cichu
+     * ustawic tabele w zlej kolejnosci.
+     */
+    private static long tableNumber(Path file) {
+        String name = file.getFileName().toString();
+        String digits = name.substring(SST_PREFIX.length(), name.length() - SST_SUFFIX.length());
+        try {
+            return Long.parseLong(digits);
+        } catch (NumberFormatException e) {
+            throw new IllegalStateException("nieoczekiwana nazwa pliku SSTable: " + name, e);
+        }
+    }
+
+    /** Niedokonczone zapisy z poprzedniego zycia procesu — bezpieczne do skasowania. */
+    private static void deleteLeftoverTempFiles(Path dir) throws IOException {
+        try (DirectoryStream<Path> ls = Files.newDirectoryStream(dir, "*" + TMP_SUFFIX)) {
+            for (Path f : ls) {
+                Files.deleteIfExists(f);
+            }
+        }
     }
 }

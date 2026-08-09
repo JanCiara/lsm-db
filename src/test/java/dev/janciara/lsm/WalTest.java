@@ -71,4 +71,20 @@ class WalTest {
         assertArrayEquals(b("a"), got.get(0).key());
         assertArrayEquals(b("b"), got.get(1).key());
     }
+
+    @Test
+    void truncateClearsHistoryButKeepsLogUsable(@TempDir Path dir) throws IOException {
+        Path log = dir.resolve("wal.log");
+        try (Wal wal = Wal.open(log)) {
+            wal.append(Record.value(b("stary"), b("1"), 0));
+            wal.truncate(); // tak jak po zrzucie memtable do SSTable
+            assertEquals(0, Files.size(log));
+
+            wal.append(Record.value(b("nowy"), b("2"), 1));
+        }
+
+        List<Record> got = replayAll(log);
+        assertEquals(1, got.size(), "po truncate zostaja tylko rekordy dopisane pozniej");
+        assertArrayEquals(b("nowy"), got.get(0).key());
+    }
 }

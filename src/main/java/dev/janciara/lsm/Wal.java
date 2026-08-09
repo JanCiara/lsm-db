@@ -30,20 +30,19 @@ import java.util.function.Consumer;
  */
 public final class Wal implements AutoCloseable {
 
-    private final FileOutputStream fos;
-    private final FileDescriptor fd;
-    private final OutputStream out;
+    private final Path file;
+    private FileDescriptor fd;
+    private OutputStream out;
 
-    private Wal(FileOutputStream fos, FileDescriptor fd, OutputStream out) {
-        this.fos = fos;
-        this.fd = fd;
-        this.out = out;
+    private Wal(Path file) {
+        this.file = file;
     }
 
     /** Otwiera log do dopisywania (tworzy plik, jesli nie istnieje). Nie robi replay. */
     public static Wal open(Path file) throws IOException {
-        FileOutputStream fos = new FileOutputStream(file.toFile(), /*append*/ true);
-        return new Wal(fos, fos.getFD(), new BufferedOutputStream(fos));
+        Wal wal = new Wal(file);
+        wal.openStream(/*append*/ true);
+        return wal;
     }
 
     /** Dopisuje rekord i wymusza go na dysk (flush + fsync). */
@@ -51,6 +50,27 @@ public final class Wal implements AutoCloseable {
         Encoding.writeRecord(out, r);
         out.flush();   // bufor -> OS
         fd.sync();     // OS -> dysk
+    }
+
+    /**
+     * Kasuje zawartosc logu i zostawia go otwartym do dalszego dopisywania.
+     *
+     * <p>Wolane po zrzucie memtable do SSTable: skoro te rekordy leza juz trwale w niemutowalnym
+     * pliku, log przestaje byc potrzebny i moze zaczac rosnac od zera. Kolejnosc jest istotna —
+     * najpierw kompletna SSTable, dopiero potem czyszczenie logu. Crash pomiedzy tymi krokami
+     * kosztuje tylko powtorzony replay tych samych rekordow, nigdy ich utrate.
+     */
+    public void truncate() throws IOException {
+        out.flush();
+        out.close();
+        openStream(/*append*/ false); // otwarcie bez append zeruje plik
+        fd.sync();
+    }
+
+    private void openStream(boolean append) throws IOException {
+        FileOutputStream fos = new FileOutputStream(file.toFile(), append);
+        this.fd = fos.getFD();
+        this.out = new BufferedOutputStream(fos);
     }
 
     /**

@@ -23,11 +23,21 @@ import java.util.TreeMap;
  */
 public final class MemTable {
 
+    /**
+     * Zryczaltowany narzut na wpis (wezel TreeMap, naglowki obiektow, referencje). Nie chodzi
+     * o dokladny rachunek pamieci, tylko o to, zeby prog zrzutu nie ignorowal miliona pustych
+     * kluczy — sam rozmiar danych bylby wtedy zerowy.
+     */
+    private static final long ENTRY_OVERHEAD_BYTES = 64;
+
     private final TreeMap<byte[], Record> entries = new TreeMap<>(Arrays::compareUnsigned);
+    private long sizeInBytes;
 
     /** Wstawia lub nadpisuje wpis dla {@code r.key()}. */
     public void put(Record r) {
-        entries.put(r.key(), r);
+        Record replaced = entries.put(r.key(), r);
+        if (replaced != null) sizeInBytes -= weigh(replaced);
+        sizeInBytes += weigh(r);
     }
 
     /** Zwraca przechowywany rekord (moze byc tombstone), albo empty gdy klucza nie ma. */
@@ -35,16 +45,35 @@ public final class MemTable {
         return Optional.ofNullable(entries.get(key));
     }
 
-    /** Rekordy w kolejnosci rosnacych kluczy — pod zrzut do SSTable (M2) i testy. */
+    /**
+     * Rekordy w kolejnosci rosnacych kluczy — dokladnie w postaci, jakiej oczekuje
+     * {@link SSTable#write}. To <b>widok</b> na zywa mape, nie kopia: przeczytaj go do konca
+     * (czyli zapisz tabele) zanim wywolasz {@link #clear()}.
+     */
     public Collection<Record> snapshot() {
         return entries.values();
+    }
+
+    /** Kasuje wszystko — wolane po udanym zrzucie do SSTable. */
+    public void clear() {
+        entries.clear();
+        sizeInBytes = 0;
     }
 
     public int size() {
         return entries.size();
     }
 
+    /** Przyblizone zuzycie pamieci; {@link LsmStore} porownuje je z progiem zrzutu. */
+    public long sizeInBytes() {
+        return sizeInBytes;
+    }
+
     public boolean isEmpty() {
         return entries.isEmpty();
+    }
+
+    private static long weigh(Record r) {
+        return r.key().length + r.value().length + ENTRY_OVERHEAD_BYTES;
     }
 }
