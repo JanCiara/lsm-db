@@ -23,14 +23,14 @@ class EncodingTest {
 
     @Test
     void absurdBlobLengthIsRejectedAsCorruption() {
-        // uvarint kodujacy 2^60 jako dlugosc klucza — bez walidacji skonczyloby sie
-        // NegativeArraySizeException albo probą alokacji gigabajtow
+        // a uvarint encoding 2^60 as the key length — without validation this would end in
+        // NegativeArraySizeException or an attempt to allocate gigabytes
         var bogus = new ByteArrayOutputStream();
         assertDoesNotThrow(() -> Encoding.writeUVarLong(bogus, 1L << 60));
 
         var in = new ByteArrayInputStream(bogus.toByteArray());
         IOException e = assertThrows(IOException.class, () -> Encoding.readRecord(in));
-        assertTrue(e.getMessage().contains("nierealna dlugosc"), e.getMessage());
+        assertTrue(e.getMessage().contains("implausible length"), e.getMessage());
     }
 
     @Test
@@ -44,7 +44,7 @@ class EncodingTest {
 
     @Test
     void writingOversizedBlobIsRejectedUpFront() {
-        // Symetria: skoro odczyt odrzuca takie dlugosci, zapis nie moze ich produkowac.
+        // Symmetry: since reads reject such lengths, writes must not be able to produce them.
         byte[] tooBig = new byte[Encoding.MAX_BLOB_LENGTH + 1];
         assertThrows(IllegalArgumentException.class,
                 () -> Encoding.writeBlob(OutputStream.nullOutputStream(), tooBig));
@@ -69,12 +69,12 @@ class EncodingTest {
     void smallValuesUseOneByte() throws IOException {
         var out = new ByteArrayOutputStream();
         Encoding.writeUVarLong(out, 127);
-        assertEquals(1, out.toByteArray().length, "127 powinno zajac 1 bajt");
+        assertEquals(1, out.toByteArray().length, "127 should take 1 byte");
     }
 
     @Test
     void unsignedMaxIsNotMistakenForEof() throws IOException {
-        // -1L = unsigned 64-bit max. Wczesniej kolidowalo z sentinelem EOF.
+        // -1L = unsigned 64-bit max. This used to collide with the EOF sentinel.
         var out = new ByteArrayOutputStream();
         Encoding.writeUVarLong(out, -1L);
         assertEquals(-1L, Encoding.readUVarLong(new ByteArrayInputStream(out.toByteArray())));
@@ -120,7 +120,7 @@ class EncodingTest {
         assertEquals(123_456_789L, back.seqNo());
     }
 
-    // ---- streaming (jak w WAL) ---------------------------------------------
+    // ---- streaming (as in the WAL) -----------------------------------------
 
     @Test
     void multipleRecordsStreamAndStopAtEof() throws IOException {
@@ -139,7 +139,7 @@ class EncodingTest {
             count++;
         }
         assertEquals(5, count);
-        assertNull(Encoding.readRecord(in), "po EOF kolejny odczyt = null");
+        assertNull(Encoding.readRecord(in), "another read past EOF = null");
     }
 
     @Test

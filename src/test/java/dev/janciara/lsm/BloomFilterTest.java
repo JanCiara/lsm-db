@@ -34,24 +34,24 @@ class BloomFilterTest {
         assertTrue(f.mightContain(b("b")));
         assertTrue(f.mightContain(b("kot")));
         assertTrue(f.mightContain(b("user:1")));
-        assertTrue(f.mightContain(b("")), "pusty klucz tez jest kluczem");
+        assertTrue(f.mightContain(b("")), "an empty key is a key too");
     }
 
     @Test
     void missingKeysAreUsuallyRejected() {
         var keys = new String[1000];
         for (int i = 0; i < keys.length; i++) {
-            keys[i] = "klucz:" + i;
+            keys[i] = "key:" + i;
         }
         BloomFilter f = filterOf(keys);
 
         int falsePositives = 0;
         for (int i = 0; i < 10_000; i++) {
-            if (f.mightContain(b("nieistniejacy:" + i))) falsePositives++;
+            if (f.mightContain(b("nonexistent:" + i))) falsePositives++;
         }
-        // Teoria dla 10 bitow/klucz to ~1%; luzny prog, zeby test nie migotal.
+        // Theory says ~1% for 10 bits/key; a loose bound so the test does not flake.
         assertTrue(falsePositives < 500,
-                "falszywych trafien " + falsePositives + "/10000, oczekiwane ok. 1%");
+                falsePositives + "/10000 false positives, expected around 1%");
     }
 
     @Test
@@ -60,7 +60,7 @@ class BloomFilterTest {
         for (int i = 0; i < keys.length; i++) {
             keys[i] = "k" + i;
         }
-        // Ciasny filtr: 2 bity na klucz zamiast 10. Bledy w gore sa dozwolone, w dol nigdy.
+        // A cramped filter: 2 bits per key instead of 10. Erring upwards is allowed, downwards never.
         long[] hashes = new long[keys.length];
         for (int i = 0; i < keys.length; i++) {
             hashes[i] = BloomFilter.hash(b(keys[i]));
@@ -68,7 +68,7 @@ class BloomFilterTest {
         BloomFilter f = BloomFilter.build(hashes, keys.length, 2);
 
         for (String key : keys) {
-            assertTrue(f.mightContain(b(key)), "falszywy negatyw dla " + key + " — to zawsze blad");
+            assertTrue(f.mightContain(b(key)), "false negative for " + key + " — always a bug");
         }
     }
 
@@ -82,13 +82,13 @@ class BloomFilterTest {
         BloomFilter big = filterOf(manyKeys);
 
         assertEquals(7, small.hashCount(), "k = round(10 * ln2)");
-        assertEquals(20_000, big.bitCount(), "10 bitow na klucz");
+        assertEquals(20_000, big.bitCount(), "10 bits per key");
         assertTrue(big.bitCount() > small.bitCount());
     }
 
     @Test
     void serializationRoundTrips() throws IOException {
-        BloomFilter original = filterOf("a", "b", "c", "dlugi-klucz-z-myslnikami");
+        BloomFilter original = filterOf("a", "b", "c", "a-long-key-with-dashes");
 
         var bos = new ByteArrayOutputStream();
         original.writeTo(bos);
@@ -98,8 +98,8 @@ class BloomFilterTest {
         assertEquals(original.hashCount(), restored.hashCount());
         assertEquals(original.byteSize(), restored.byteSize());
         assertTrue(restored.mightContain(b("a")));
-        assertTrue(restored.mightContain(b("dlugi-klucz-z-myslnikami")));
-        assertFalse(restored.mightContain(b("czegos-takiego-nie-bylo")));
+        assertTrue(restored.mightContain(b("a-long-key-with-dashes")));
+        assertFalse(restored.mightContain(b("no-such-thing-was-ever-added")));
     }
 
     @Test
@@ -113,7 +113,7 @@ class BloomFilterTest {
     void emptyFilterRejectsEverything() {
         BloomFilter f = BloomFilter.build(new long[0], 0);
 
-        assertFalse(f.mightContain(b("cokolwiek")));
-        assertEquals(64, f.bitCount(), "minimalny rozmiar, zeby nie dzielic przez zero");
+        assertFalse(f.mightContain(b("anything")));
+        assertEquals(64, f.bitCount(), "a minimum size, so we never divide by zero");
     }
 }

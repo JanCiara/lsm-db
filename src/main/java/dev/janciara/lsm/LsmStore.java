@@ -10,33 +10,33 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Implementacja {@link KVStore} (M4): WAL + memtable + niemutowalne SSTable + scalanie tabel.
+ * The {@link KVStore} implementation: WAL + memtable + immutable SSTables + table merging.
  *
- * <p><b>Sciezka zapisu.</b> Kazdy {@code put}/{@code delete} najpierw dopisuje rekord do
- * {@link Wal} (trwalosc), a dopiero potem uwidacznia go w {@link MemTable} (widocznosc). Gdy
- * memtable przekroczy prog rozmiaru, jej zawartosc laduje w nowej {@link SSTable}, memtable
- * startuje pusta, a WAL jest zerowany.
+ * <p><b>Write path.</b> Every {@code put}/{@code delete} first appends a record to the {@link Wal}
+ * (durability), and only then makes it visible in the {@link MemTable} (visibility). Once the
+ * memtable crosses its size threshold, its contents land in a new {@link SSTable}, the memtable
+ * starts empty, and the WAL is cleared.
  *
- * <p><b>Sciezka odczytu</b> idzie od najswiezszej warstwy do najstarszej: memtable, potem SSTable
- * od najnowszej do najstarszej. Tabela, ktora klucza nie ma, odpowiada zwykle bez czytania danych —
- * odsiewa ja zakres kluczy albo filtr Blooma ({@link SSTable#mightContain}). Pierwsze trafienie
- * wygrywa — nie trzeba porownywac {@code seqNo},
- * bo kazdy zrzut zawiera rekordy nowsze niz wszystko, co zrzucono wczesniej. Znaleziony rekord
- * moze byc tombstone; wtedy klucz jest dla swiata usuniety, mimo ze starsza tabela ma dla niego
- * wartosc. To wlasnie dlatego usuniecie moze byc zapisem.
+ * <p><b>Read path</b> walks from the freshest layer to the oldest: memtable, then SSTables newest
+ * to oldest. A table that does not hold the key usually answers without reading any data — the key
+ * range or the Bloom filter rejects it ({@link SSTable#mightContain}). The first hit wins; there is
+ * no need to compare {@code seqNo}, because every flush contains records newer than everything
+ * flushed before it. The record found may be a tombstone, in which case the key is deleted as far
+ * as the world is concerned, even though an older table still holds a value for it. That is exactly
+ * why a deletion can be a write.
  *
- * <p><b>Odtwarzanie po restarcie.</b> {@link #open} wczytuje metadane wszystkich plikow
- * {@code sst-*.sst}, odtwarza WAL do memtable i ustawia licznik {@code seqNo} na
- * {@code max(seqNo w SSTable i w logu) + 1}. Crash pomiedzy zapisem SSTable a wyczyszczeniem WAL
- * jest nieszkodliwy: replay wroci rekordami, ktore juz sa na dysku, a te trafia do memtable —
- * czyli do warstwy wygrywajacej. Zaden odczyt nie zobaczy przez to starszej wartosci.
+ * <p><b>Recovery after a restart.</b> {@link #open} loads the metadata of every {@code sst-*.sst}
+ * file, replays the WAL into the memtable and sets the {@code seqNo} counter to
+ * {@code max(seqNo across SSTables and the log) + 1}. A crash between writing an SSTable and
+ * clearing the WAL is harmless: replay returns records that are already on disk, and they land in
+ * the memtable — the winning layer. No read sees an older value because of it.
  *
- * <p><b>Compaction.</b> Bez scalania liczba tabel roslaby bez konca, a nadpisany albo skasowany
- * klucz zajmowalby miejsce na zawsze — tombstone to przeciez tez zapis. Po przekroczeniu progu
- * liczby tabel {@link #compact()} scala wszystkie w jedna, zostawiajac po jednej, najswiezszej
- * wersji kazdego klucza i wyrzucajac tombstone'y.
+ * <p><b>Compaction.</b> Without merging, the number of tables would grow without bound and an
+ * overwritten or deleted key would occupy space forever — a tombstone is a write too, after all.
+ * Once the table count crosses the threshold, {@link #compact()} merges them all into one, keeping
+ * a single freshest version of each key and discarding tombstones.
  *
- * <p>Klasa nie jest bezpieczna watkowo — zaklada uzycie jednowatkowe.
+ * <p>Not thread-safe — the class assumes single-threaded use.
  */
 public final class LsmStore implements KVStore {
 
@@ -45,15 +45,15 @@ public final class LsmStore implements KVStore {
     private static final String SST_SUFFIX = ".sst";
     private static final String TMP_SUFFIX = ".tmp";
 
-    /** Domyslny prog zrzutu memtable na dysk. */
+    /** Default memtable size at which it is flushed to disk. */
     public static final long DEFAULT_FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024;
-    /** Domyslna liczba tabel, po ktorej uruchamia sie scalanie. */
+    /** Default number of tables that triggers a merge. */
     public static final int DEFAULT_COMPACTION_TRIGGER = 4;
 
     private final Path dir;
     private final MemTable memtable;
     private final Wal wal;
-    /** Od najstarszej do najnowszej — odczyt przeglada te liste od konca. */
+    /** Oldest to newest — reads scan this list from the end. */
     private final List<SSTable> sstables;
     private final Options options;
     private long nextSeqNo;
@@ -71,24 +71,24 @@ public final class LsmStore implements KVStore {
     }
 
     /**
-     * Nastawy silnika. Zebrane w jeden obiekt, bo inaczej {@code open} mialoby cztery parametry
-     * tego samego typu obok siebie — a takie API zaprasza do przestawienia argumentow.
+     * Engine settings. Gathered into one object, because otherwise {@code open} would take several
+     * parameters of the same type side by side — an API that invites swapped arguments.
      *
-     * @param flushThresholdBytes rozmiar memtable, po ktorym leci zrzut do SSTable
-     * @param compactionTrigger   liczba tabel, po ktorej leci scalanie
-     * @param durability          co ma sie stac z rekordem w WAL, zanim {@code put} wroci
+     * @param flushThresholdBytes memtable size at which it gets flushed to an SSTable
+     * @param compactionTrigger   number of tables that triggers a merge
+     * @param durability          what must happen to a WAL record before {@code put} returns
      */
     public record Options(long flushThresholdBytes, int compactionTrigger, Wal.Durability durability) {
 
         public Options {
             if (flushThresholdBytes <= 0) {
-                throw new IllegalArgumentException("prog zrzutu musi byc dodatni");
+                throw new IllegalArgumentException("flush threshold must be positive");
             }
             if (compactionTrigger < 2) {
-                throw new IllegalArgumentException("scalanie ma sens dopiero od 2 tabel");
+                throw new IllegalArgumentException("merging only makes sense from 2 tables up");
             }
             if (durability == null) {
-                throw new IllegalArgumentException("durability musi byc podane");
+                throw new IllegalArgumentException("durability must be given");
             }
         }
 
@@ -110,14 +110,14 @@ public final class LsmStore implements KVStore {
         }
     }
 
-    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnymi nastawami. */
+    /** Opens (or creates) a store in directory {@code dir} with default settings. */
     public static LsmStore open(Path dir) {
         return open(dir, Options.defaults());
     }
 
     /**
-     * Otwiera (lub tworzy) sklep w katalogu {@code dir}. Male progi wymuszaja czeste zrzuty
-     * i scalania — przydatne w testach i przy zabawie z ksztaltem drzewa.
+     * Opens (or creates) a store in directory {@code dir}. Small thresholds force frequent flushes
+     * and merges — handy in tests and when playing with the shape of the tree.
      */
     public static LsmStore open(Path dir, Options options) {
         try {
@@ -125,7 +125,7 @@ public final class LsmStore implements KVStore {
             deleteLeftoverTempFiles(dir);
 
             List<SSTable> sstables = openSSTables(dir);
-            long maxSeqNo = -1L; // -1 => brak historii => nextSeqNo startuje od 0
+            long maxSeqNo = -1L; // -1 => no history => nextSeqNo starts at 0
             long maxTableNumber = -1L;
             for (SSTable t : sstables) {
                 maxSeqNo = Math.max(maxSeqNo, t.maxSeqNo());
@@ -134,8 +134,8 @@ public final class LsmStore implements KVStore {
 
             MemTable memtable = new MemTable();
             long[] seqNo = {maxSeqNo};
-            // Replay sam ucina ewentualny urwany ogon logu, wiec ponizsze open() dopisuje
-            // za ostatnim kompletnym rekordem, a nie za polowka rekordu sprzed crashu.
+            // Replay trims any torn tail itself, so the open() below appends after the last
+            // complete record rather than after half a record left over from a crash.
             Wal.replay(dir.resolve(WAL_FILE), r -> {
                 memtable.put(r);
                 if (r.seqNo() > seqNo[0]) seqNo[0] = r.seqNo();
@@ -145,7 +145,7 @@ public final class LsmStore implements KVStore {
             return new LsmStore(dir, memtable, wal, sstables, options,
                     seqNo[0] + 1, maxTableNumber + 1);
         } catch (IOException e) {
-            throw new UncheckedIOException("nie udalo sie otworzyc sklepu w " + dir, e);
+            throw new UncheckedIOException("failed to open the store in " + dir, e);
         }
     }
 
@@ -171,9 +171,9 @@ public final class LsmStore implements KVStore {
     }
 
     /**
-     * Zrzuca memtable do nowej SSTable i zeruje WAL. Pusta memtable = no-op (nie robimy pustych
-     * plikow). Normalnie wola sie samo po przekroczeniu progu; recznie przydaje sie w testach
-     * i gdy chcemy zamknac sklep z „czystym" logiem.
+     * Flushes the memtable into a new SSTable and clears the WAL. An empty memtable is a no-op (we
+     * do not create empty files). Normally this fires on its own once the threshold is crossed;
+     * calling it by hand is useful in tests and when closing a store with a "clean" log.
      */
     public void flush() {
         if (memtable.isEmpty()) return;
@@ -182,48 +182,48 @@ public final class LsmStore implements KVStore {
             memtable.clear();
             wal.truncate();
         } catch (IOException e) {
-            throw new UncheckedIOException("zrzut memtable do SSTable nie powiodl sie", e);
+            throw new UncheckedIOException("flushing the memtable to an SSTable failed", e);
         }
         if (sstables.size() >= options.compactionTrigger()) compact();
     }
 
     /**
-     * Scala wszystkie SSTable w jedna: kazdy klucz zostaje w najswiezszej wersji, a tombstone'y
-     * znikaja calkiem. Dopiero to odzyskuje miejsce po nadpisaniach i usunieciach — do tego momentu
-     * kazdy zapis, takze {@code delete}, tylko powieksza zbior plikow. No-op ponizej dwoch tabel.
+     * Merges all SSTables into one: every key survives in its freshest version, and tombstones
+     * disappear entirely. Only this reclaims space taken by overwrites and deletions — until then
+     * every write, {@code delete} included, only grows the set of files. A no-op below two tables.
      *
-     * <p><b>Odpornosc na crash</b> opiera sie na dwoch rzeczach i warto rozumiec obie:
+     * <p><b>Crash safety</b> rests on two things, and both are worth understanding:
      *
-     * <p>1. Scalona tabela dostaje <b>numer wyzszy</b> niz wszystkie wejsciowe, wiec od momentu
-     * pojawienia sie na dysku przykrywa je w odczycie. Crash po jej zapisaniu, a przed skasowaniem
-     * zrodel, zostawia tylko martwe pliki — nigdy zlych danych.
+     * <p>1. The merged table gets a <b>higher number</b> than any of its inputs, so from the moment
+     * it appears on disk it shadows them on the read path. A crash after writing it but before
+     * deleting the sources leaves only dead files — never bad data.
      *
-     * <p>2. Zrodla kasujemy <b>od najstarszego</b>. To nie jest kosmetyka: gdyby posypac sie
-     * odwrotnie, crash moglby zabrac tombstone'a, zostawiajac pod nim starsza wartosc tego samego
-     * klucza — i skasowany klucz wracalby z martwych. Kasowanie od dolu gwarantuje, ze zbior
-     * ocalalych tabel to zawsze <i>koncowy</i> fragment historii, w ktorym najswiezszy rekord
-     * kazdego klucza wciaz jest obecny.
+     * <p>2. Sources are deleted <b>oldest-first</b>. This is not cosmetic: were it the other way
+     * round, a crash could take away a tombstone while leaving an older value of the same key
+     * underneath — and the deleted key would come back from the dead. Deleting from the bottom up
+     * guarantees that the set of surviving tables is always a <i>trailing</i> stretch of history,
+     * one in which the freshest record of every key is still present.
      */
     public void compact() {
         if (sstables.size() < 2) return;
         try {
             List<SSTable> inputs = List.copyOf(sstables);
-            // Scalamy komplet tabel, wiec pod spodem nie zostaje nic, co tombstone mialby przykrywac.
+            // We merge the complete set, so nothing is left underneath for a tombstone to hide.
             Optional<SSTable> merged = SSTable.compact(nextTablePath(), inputs, /*dropTombstones*/ true);
 
-            for (SSTable stale : inputs) { // kolejnosc listy = od najstarszej
-                stale.delete();            // delete() zamyka kanal przed skasowaniem pliku
+            for (SSTable stale : inputs) { // list order = oldest first
+                stale.delete();            // delete() closes the channel before removing the file
             }
             SSTable.syncDir(dir);
 
             sstables.clear();
             merged.ifPresent(sstables::add);
         } catch (IOException e) {
-            throw new UncheckedIOException("scalanie SSTable nie powiodlo sie", e);
+            throw new UncheckedIOException("merging SSTables failed", e);
         }
     }
 
-    /** Liczba SSTable na dysku — podglad stanu silnika (testy, przyszle metryki). */
+    /** Number of SSTables on disk — a peek at engine state (tests, future metrics). */
     public int sstableCount() {
         return sstables.size();
     }
@@ -233,33 +233,33 @@ public final class LsmStore implements KVStore {
         try {
             wal.close();
             for (SSTable table : sstables) {
-                table.close(); // kazda tabela trzyma otwarty kanal od momentu otwarcia
+                table.close(); // every table holds an open channel from the moment it is opened
             }
             sstables.clear();
         } catch (IOException e) {
-            throw new UncheckedIOException("nie udalo sie zamknac sklepu", e);
+            throw new UncheckedIOException("failed to close the store", e);
         }
     }
 
-    // ---- wewnetrzne ----------------------------------------------------------
+    // ---- internals -----------------------------------------------------------
 
-    /** WAL najpierw (trwalosc), memtable potem (widocznosc), na koncu ewentualny zrzut. */
+    /** WAL first (durability), memtable second (visibility), then a flush if one is due. */
     private void writeAhead(Record r) {
         try {
             wal.append(r);
         } catch (IOException e) {
-            throw new UncheckedIOException("zapis do WAL nie powiodl sie", e);
+            throw new UncheckedIOException("writing to the WAL failed", e);
         }
         memtable.put(r);
         if (memtable.sizeInBytes() >= options.flushThresholdBytes()) flush();
     }
 
-    /** Sciezka kolejnej tabeli; numer rosnie z kazdym zrzutem i scaleniem. */
+    /** Path of the next table; the number grows with every flush and every merge. */
     private Path nextTablePath() {
         return dir.resolve(String.format("%s%06d%s", SST_PREFIX, nextTableNumber++, SST_SUFFIX));
     }
 
-    /** Przeglada tabele od najnowszej — pierwsze trafienie jest z definicji najswiezsze. */
+    /** Scans tables newest-first — the first hit is by definition the freshest. */
     private Optional<Record> searchSSTables(byte[] key) {
         for (int i = sstables.size() - 1; i >= 0; i--) {
             SSTable table = sstables.get(i);
@@ -267,13 +267,13 @@ public final class LsmStore implements KVStore {
                 Optional<Record> found = table.get(key);
                 if (found.isPresent()) return found;
             } catch (IOException e) {
-                throw new UncheckedIOException("nie udalo sie odczytac " + table.path(), e);
+                throw new UncheckedIOException("failed to read " + table.path(), e);
             }
         }
         return Optional.empty();
     }
 
-    /** Wczytuje metadane tabel z katalogu, posortowane rosnaco po numerze (czyli od najstarszej). */
+    /** Loads table metadata from the directory, sorted by ascending number (i.e. oldest first). */
     private static List<SSTable> openSSTables(Path dir) throws IOException {
         var files = new ArrayList<Path>();
         try (DirectoryStream<Path> ls = Files.newDirectoryStream(dir, SST_PREFIX + "*" + SST_SUFFIX)) {
@@ -287,11 +287,11 @@ public final class LsmStore implements KVStore {
                 tables.add(SSTable.open(f));
             }
         } catch (IOException | RuntimeException e) {
-            for (SSTable opened : tables) { // nie zostawiamy otwartych kanalow po nieudanym starcie
+            for (SSTable opened : tables) { // do not leave channels open after a failed startup
                 try {
                     opened.close();
                 } catch (IOException ignored) {
-                    // i tak lecimy z pierwotnym bledem
+                    // we are throwing the original error anyway
                 }
             }
             throw e;
@@ -300,9 +300,9 @@ public final class LsmStore implements KVStore {
     }
 
     /**
-     * Numer z nazwy {@code sst-000007.sst}. Rosnie z kazdym zrzutem, wiec porzadek nazw = porzadek
-     * swiezosci danych. Nazwa nie pasujaca do wzorca konczy otwarcie bledem, zamiast po cichu
-     * ustawic tabele w zlej kolejnosci.
+     * The number from a name like {@code sst-000007.sst}. It grows with every flush, so name order
+     * is data-freshness order. A name that does not match the pattern fails the open instead of
+     * quietly putting tables in the wrong order.
      */
     private static long tableNumber(Path file) {
         String name = file.getFileName().toString();
@@ -310,11 +310,11 @@ public final class LsmStore implements KVStore {
         try {
             return Long.parseLong(digits);
         } catch (NumberFormatException e) {
-            throw new IllegalStateException("nieoczekiwana nazwa pliku SSTable: " + name, e);
+            throw new IllegalStateException("unexpected SSTable file name: " + name, e);
         }
     }
 
-    /** Niedokonczone zapisy z poprzedniego zycia procesu — bezpieczne do skasowania. */
+    /** Unfinished writes from a previous life of the process — safe to delete. */
     private static void deleteLeftoverTempFiles(Path dir) throws IOException {
         try (DirectoryStream<Path> ls = Files.newDirectoryStream(dir, "*" + TMP_SUFFIX)) {
             for (Path f : ls) {

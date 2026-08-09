@@ -20,14 +20,14 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 
 /**
- * Ile kosztuje scalenie i jak skaluje sie z liczba tabel.
+ * What a merge costs, and how it scales with the number of tables.
  *
- * <p>To pomiar write amplification przyjetej w M3 polityki: scalamy <b>wszystkie</b> tabele naraz,
- * wiec kazde scalenie przepisuje caly zbior danych. Benchmark pokazuje cene tej prostoty i daje
- * punkt odniesienia, gdyby kiedys wejsc w leveled albo size-tiered.
+ * <p>This measures the write amplification of the policy adopted in M3: we merge <b>all</b> tables
+ * at once, so every merge rewrites the entire data set. The benchmark shows the price of that
+ * simplicity and gives a baseline should leveled or size-tiered compaction ever be worth trying.
  *
- * <p>Mierzymy pojedyncze wywolanie ({@code SingleShotTime}), bo scalenie jest operacja rzadka
- * i droga — usrednianie milionow powtorzen nic by tu nie powiedzialo.
+ * <p>We measure a single invocation ({@code SingleShotTime}), because a merge is a rare and
+ * expensive operation — averaging millions of repetitions would say nothing useful here.
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.SingleShotTime)
@@ -45,8 +45,8 @@ public class CompactionBenchmark {
     private LsmStore store;
 
     /**
-     * Swiezy sklep przed kazdym pomiarem — scalenie jest jednorazowe, drugie wywolanie na tym
-     * samym stanie mierzyloby juz tylko no-op na jednej tabeli.
+     * A fresh store before every measurement — a merge is one-shot, and a second call on the same
+     * state would only measure a no-op on a single table.
      */
     @Setup(Level.Invocation)
     public void setUp() throws IOException {
@@ -58,7 +58,7 @@ public class CompactionBenchmark {
         byte[] value = "x".repeat(100).getBytes(StandardCharsets.UTF_8);
         for (int t = 0; t < tables; t++) {
             for (int i = 0; i < KEYS_PER_TABLE; i++) {
-                // Klucze celowo sie powtarzaja miedzy tabelami — scalanie ma co odrzucac.
+                // Keys repeat across tables on purpose — the merge has something to discard.
                 store.put(key(i), value);
             }
             store.flush();
@@ -78,6 +78,6 @@ public class CompactionBenchmark {
     }
 
     private static byte[] key(long i) {
-        return String.format("klucz:%012d", i).getBytes(StandardCharsets.UTF_8);
+        return String.format("key:%012d", i).getBytes(StandardCharsets.UTF_8);
     }
 }

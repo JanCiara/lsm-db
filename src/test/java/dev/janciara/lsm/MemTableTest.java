@@ -50,21 +50,21 @@ class MemTableTest {
         mt.put(Record.tombstone(b("k"), 5));
 
         Record r = mt.get(b("k")).orElseThrow();
-        assertTrue(r.tombstone(), "memtable oddaje caly rekord, wlacznie z tombstone");
+        assertTrue(r.tombstone(), "the memtable hands back the whole record, tombstone included");
     }
 
     @Test
     void snapshotIsSortedUnsignedByKey() {
         var mt = new MemTable();
-        // 0x80 > 0x7F w porzadku unsigned (przy signed byloby odwrotnie).
+        // 0x80 > 0x7F in unsigned order (signed comparison would put them the other way round).
         byte[] hi = {(byte) 0x80};
         byte[] lo = {(byte) 0x7F};
         mt.put(Record.value(hi, b("hi"), 2));
         mt.put(Record.value(lo, b("lo"), 1));
 
         List<Record> ordered = List.copyOf(mt.snapshot());
-        assertArrayEquals(lo, ordered.get(0).key(), "0x7F powinno byc pierwsze");
-        assertArrayEquals(hi, ordered.get(1).key(), "0x80 powinno byc drugie (unsigned)");
+        assertArrayEquals(lo, ordered.get(0).key(), "0x7F should come first");
+        assertArrayEquals(hi, ordered.get(1).key(), "0x80 should come second (unsigned)");
         assertFalse(mt.isEmpty());
     }
 }

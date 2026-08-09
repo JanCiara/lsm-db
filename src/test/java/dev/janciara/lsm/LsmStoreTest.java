@@ -30,7 +30,7 @@ class LsmStoreTest {
         return Files.size(dir.resolve("wal.log"));
     }
 
-    /** Pliki tabel realnie lezace na dysku — do sprawdzania, czy scalanie po sobie sprzata. */
+    /** Table files actually present on disk — to check that merging cleans up after itself. */
     private static List<Path> sstFiles(Path dir) throws IOException {
         try (var ls = Files.list(dir)) {
             return ls.filter(p -> p.getFileName().toString().endsWith(".sst")).sorted().toList();
@@ -86,8 +86,8 @@ class LsmStoreTest {
             byte[] key = b("k");
             byte[] value = b("v0");
             db.put(key, value);
-            value[1] = (byte) '9';           // caller mutuje po zapisie
-            assertArrayEquals(b("v0"), db.get(b("k")).orElseThrow(), "sklep robi kopie obronna");
+            value[1] = (byte) '9';           // caller mutates after the write
+            assertArrayEquals(b("v0"), db.get(b("k")).orElseThrow(), "the store makes a defensive copy");
         }
     }
 
@@ -97,7 +97,7 @@ class LsmStoreTest {
             db.put(b("a"), b("1"));
             db.put(b("b"), b("2"));
         }
-        // Nowy proces/otwarcie — stan odtworzony wylacznie z WAL.
+        // A new process/open — state rebuilt purely from the WAL.
         try (LsmStore db = LsmStore.open(dir)) {
             assertArrayEquals(b("1"), db.get(b("a")).orElseThrow());
             assertArrayEquals(b("2"), db.get(b("b")).orElseThrow());
@@ -111,7 +111,7 @@ class LsmStoreTest {
             db.delete(b("k"));
         }
         try (LsmStore db = LsmStore.open(dir)) {
-            assertTrue(db.get(b("k")).isEmpty(), "tombstone przetrwal replay");
+            assertTrue(db.get(b("k")).isEmpty(), "the tombstone survived replay");
         }
     }
 
@@ -120,7 +120,7 @@ class LsmStoreTest {
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("old"));
         }
-        // Po replay seqNo rosnie dalej, wiec nowy zapis nadpisuje stary.
+        // After replay seqNo keeps growing, so the new write overwrites the old one.
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("new"));
             assertArrayEquals(b("new"), db.get(b("k")).orElseThrow());
@@ -131,7 +131,7 @@ class LsmStoreTest {
         }
     }
 
-    // ---- M2: zrzut do SSTable ----------------------------------------------
+    // ---- M2: flushing to an SSTable ----------------------------------------
 
     @Test
     void flushMovesDataFromMemtableToSSTable(@TempDir Path dir) throws IOException {
@@ -141,8 +141,8 @@ class LsmStoreTest {
 
             db.flush();
             assertEquals(1, db.sstableCount());
-            assertEquals(0, walSize(dir), "po zrzucie log jest niepotrzebny i zerowany");
-            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "odczyt schodzi do SSTable");
+            assertEquals(0, walSize(dir), "after a flush the log is redundant and gets cleared");
+            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "the read descends into the SSTable");
         }
     }
 
@@ -151,7 +151,7 @@ class LsmStoreTest {
         try (LsmStore db = LsmStore.open(dir)) {
             db.flush();
             db.flush();
-            assertEquals(0, db.sstableCount(), "nie tworzymy pustych plikow");
+            assertEquals(0, db.sstableCount(), "we do not create empty files");
         }
     }
 
@@ -163,7 +163,7 @@ class LsmStoreTest {
             db.flush();
         }
         try (LsmStore db = LsmStore.open(dir)) {
-            assertEquals(1, db.sstableCount(), "tabela odnaleziona po nazwie pliku");
+            assertEquals(1, db.sstableCount(), "the table was found by its file name");
             assertArrayEquals(b("1"), db.get(b("a")).orElseThrow());
             assertArrayEquals(b("2"), db.get(b("b")).orElseThrow());
         }
@@ -176,11 +176,11 @@ class LsmStoreTest {
             db.flush();
 
             db.put(b("k"), b("new"));
-            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow(), "memtable bije SSTable");
+            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow(), "the memtable beats the SSTable");
 
             db.flush();
             assertEquals(2, db.sstableCount());
-            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow(), "nowsza tabela bije starsza");
+            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow(), "the newer table beats the older one");
         }
     }
 
@@ -191,10 +191,10 @@ class LsmStoreTest {
             db.flush();
 
             db.delete(b("k"));
-            assertTrue(db.get(b("k")).isEmpty(), "tombstone w memtable przykrywa SSTable");
+            assertTrue(db.get(b("k")).isEmpty(), "a tombstone in the memtable hides the SSTable");
             db.flush();
         }
-        // Tombstone przetrwal jako zwykly rekord w nowszej tabeli — wartosc dalej niewidoczna.
+        // The tombstone survived as an ordinary record in the newer table — value still hidden.
         try (LsmStore db = LsmStore.open(dir)) {
             assertEquals(2, db.sstableCount());
             assertTrue(db.get(b("k")).isEmpty());
@@ -211,16 +211,16 @@ class LsmStoreTest {
             db.put(b("c"), b("3"));
 
             assertEquals(2, db.sstableCount());
-            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "najstarsza tabela");
-            assertArrayEquals(b("2"), db.get(b("b")).orElseThrow(), "nowsza tabela");
-            assertArrayEquals(b("3"), db.get(b("c")).orElseThrow(), "jeszcze w memtable");
-            assertTrue(db.get(b("nope")).isEmpty(), "chybienie przeglada wszystko i konczy pusto");
+            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "the oldest table");
+            assertArrayEquals(b("2"), db.get(b("b")).orElseThrow(), "a newer table");
+            assertArrayEquals(b("3"), db.get(b("c")).orElseThrow(), "still in the memtable");
+            assertTrue(db.get(b("nope")).isEmpty(), "a miss walks everything and ends up empty");
         }
     }
 
     @Test
     void memtableIsFlushedAutomaticallyAfterThreshold(@TempDir Path dir) throws IOException {
-        // Prog dobrany tak, zeby zmiescilo sie kilka wpisow, a nie kilka tysiecy.
+        // A threshold sized to fit a handful of entries, not a few thousand.
         try (LsmStore db = LsmStore.open(dir, options().withFlushThresholdBytes(200))) {
             db.put(b("k0"), b("v0"));
             assertEquals(0, db.sstableCount());
@@ -228,11 +228,11 @@ class LsmStoreTest {
             for (int i = 1; i < 10; i++) {
                 db.put(b("k" + i), b("v" + i));
             }
-            assertTrue(db.sstableCount() > 0, "prog wymusil zrzut bez recznego flush()");
-            assertTrue(walSize(dir) < 200, "log zaczyna od zera po kazdym zrzucie");
+            assertTrue(db.sstableCount() > 0, "the threshold forced a flush without a manual flush()");
+            assertTrue(walSize(dir) < 200, "the log restarts from zero after every flush");
 
             for (int i = 0; i < 10; i++) {
-                assertArrayEquals(b("v" + i), db.get(b("k" + i)).orElseThrow(), "klucz k" + i);
+                assertArrayEquals(b("v" + i), db.get(b("k" + i)).orElseThrow(), "key k" + i);
             }
         }
     }
@@ -241,7 +241,7 @@ class LsmStoreTest {
     void seqNoContinuesAcrossFlushAndReopen(@TempDir Path dir) {
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("old"));
-            db.flush(); // seqNo zyje juz tylko w stopce SSTable — WAL jest pusty
+            db.flush(); // seqNo now lives only in the SSTable footer — the WAL is empty
         }
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("new"));
@@ -249,7 +249,7 @@ class LsmStoreTest {
         }
         try (LsmStore db = LsmStore.open(dir)) {
             assertArrayEquals(b("new"), db.get(b("k")).orElseThrow(),
-                    "licznik wznowiony ze stopki, wiec nowy zapis trafil do nowszej tabeli");
+                    "the counter resumed from the footer, so the new write landed in a newer table");
         }
     }
 
@@ -258,19 +258,19 @@ class LsmStoreTest {
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("flushed"));
             db.flush();
-            db.put(b("k"), b("only-in-wal")); // brak flush — zamkniecie zostawia to w logu
+            db.put(b("k"), b("only-in-wal")); // no flush — closing leaves this in the log
         }
         try (LsmStore db = LsmStore.open(dir)) {
             assertArrayEquals(b("only-in-wal"), db.get(b("k")).orElseThrow(),
-                    "replay wraca do memtable, ktora bije SSTable");
+                    "replay returns it to the memtable, which beats the SSTable");
         }
     }
 
     @Test
     void leftoverTempFileIsRemovedOnOpen(@TempDir Path dir) throws IOException {
         Files.createDirectories(dir);
-        Path junk = dir.resolve("sst-000000.sst.tmp"); // niedokonczony zrzut sprzed crashu
-        Files.writeString(junk, "polowa tabeli");
+        Path junk = dir.resolve("sst-000000.sst.tmp"); // an unfinished flush from before a crash
+        Files.writeString(junk, "half a table");
 
         try (LsmStore db = LsmStore.open(dir)) {
             assertEquals(0, db.sstableCount());
@@ -278,7 +278,7 @@ class LsmStoreTest {
         assertFalse(Files.exists(junk));
     }
 
-    // ---- M3: scalanie tabel ------------------------------------------------
+    // ---- M3: merging tables ------------------------------------------------
 
     @Test
     void compactionRunsAutomaticallyAfterTriggerCount(@TempDir Path dir) throws IOException {
@@ -287,58 +287,58 @@ class LsmStoreTest {
             db.flush();
             db.put(b("b"), b("2"));
             db.flush();
-            assertEquals(2, db.sstableCount(), "jeszcze ponizej progu");
+            assertEquals(2, db.sstableCount(), "still below the threshold");
 
             db.put(b("c"), b("3"));
             db.flush();
-            assertEquals(1, db.sstableCount(), "trzeci zrzut wyzwolil scalenie w jedna tabele");
+            assertEquals(1, db.sstableCount(), "the third flush triggered a merge into one table");
 
             assertArrayEquals(b("1"), db.get(b("a")).orElseThrow());
             assertArrayEquals(b("2"), db.get(b("b")).orElseThrow());
             assertArrayEquals(b("3"), db.get(b("c")).orElseThrow());
         }
-        assertEquals(1, sstFiles(dir).size(), "stare pliki skasowane z dysku");
+        assertEquals(1, sstFiles(dir).size(), "the old files were deleted from disk");
     }
 
     @Test
     void compactionReclaimsSpaceAfterOverwrites(@TempDir Path dir) throws IOException {
         try (LsmStore db = LsmStore.open(dir)) {
             for (int i = 0; i < 5; i++) {
-                db.put(b("k"), b("wersja-" + i)); // ten sam klucz, pieciokrotnie
+                db.put(b("k"), b("version-" + i)); // the same key, five times over
                 db.flush();
             }
             db.compact();
-            assertArrayEquals(b("wersja-4"), db.get(b("k")).orElseThrow());
+            assertArrayEquals(b("version-4"), db.get(b("k")).orElseThrow());
         }
 
         List<Path> files = sstFiles(dir);
         assertEquals(1, files.size());
         try (SSTable table = SSTable.open(files.get(0))) {
             assertEquals(1, table.entryCount(),
-                    "piec wersji klucza sprowadzone do jednej — dopiero to odzyskuje miejsce");
+                    "five versions of the key reduced to one — only this reclaims space");
         }
     }
 
     @Test
     void compactionRemovesDeletedKeysFromDisk(@TempDir Path dir) throws IOException {
         try (LsmStore db = LsmStore.open(dir)) {
-            db.put(b("zostaje"), b("v"));
-            db.put(b("znika"), b("v"));
+            db.put(b("stays"), b("v"));
+            db.put(b("goes"), b("v"));
             db.flush();
 
-            db.delete(b("znika"));
+            db.delete(b("goes"));
             db.flush();
             assertEquals(2, db.sstableCount());
 
             db.compact();
-            assertTrue(db.get(b("znika")).isEmpty());
-            assertArrayEquals(b("v"), db.get(b("zostaje")).orElseThrow());
+            assertTrue(db.get(b("goes")).isEmpty());
+            assertArrayEquals(b("v"), db.get(b("stays")).orElseThrow());
         }
 
         try (SSTable table = SSTable.open(sstFiles(dir).get(0))) {
             List<Record> onDisk = table.readAll();
-            assertEquals(1, onDisk.size(), "ani wartosc, ani tombstone nie zajmuja juz miejsca");
-            assertArrayEquals(b("zostaje"), onDisk.get(0).key());
+            assertEquals(1, onDisk.size(), "neither the value nor the tombstone takes up space now");
+            assertArrayEquals(b("stays"), onDisk.get(0).key());
         }
     }
 
@@ -351,29 +351,29 @@ class LsmStoreTest {
             db.flush();
 
             db.compact();
-            assertEquals(0, db.sstableCount(), "nie zostalo nic do zapisania");
+            assertEquals(0, db.sstableCount(), "there was nothing left to write");
             assertTrue(db.get(b("k")).isEmpty());
         }
         assertTrue(sstFiles(dir).isEmpty());
 
         try (LsmStore db = LsmStore.open(dir)) {
-            assertTrue(db.get(b("k")).isEmpty(), "klucz nie wraca po ponownym otwarciu");
+            assertTrue(db.get(b("k")).isEmpty(), "the key does not come back after reopening");
         }
     }
 
     @Test
     void compactedDataSurvivesReopen(@TempDir Path dir) {
         try (LsmStore db = LsmStore.open(dir)) {
-            db.put(b("a"), b("stare"));
+            db.put(b("a"), b("old"));
             db.flush();
-            db.put(b("a"), b("nowe"));
+            db.put(b("a"), b("new"));
             db.put(b("b"), b("2"));
             db.flush();
             db.compact();
         }
         try (LsmStore db = LsmStore.open(dir)) {
             assertEquals(1, db.sstableCount());
-            assertArrayEquals(b("nowe"), db.get(b("a")).orElseThrow());
+            assertArrayEquals(b("new"), db.get(b("a")).orElseThrow());
             assertArrayEquals(b("2"), db.get(b("b")).orElseThrow());
         }
     }
@@ -381,18 +381,18 @@ class LsmStoreTest {
     @Test
     void writesAfterCompactionStillWin(@TempDir Path dir) {
         try (LsmStore db = LsmStore.open(dir)) {
-            db.put(b("k"), b("stare"));
+            db.put(b("k"), b("old"));
             db.flush();
-            db.put(b("k"), b("srednie"));
+            db.put(b("k"), b("middle"));
             db.flush();
             db.compact();
 
-            db.put(b("k"), b("nowe")); // seqNo musi byc wyzsze niz w scalonej tabeli
+            db.put(b("k"), b("new")); // seqNo must be higher than anything in the merged table
             db.flush();
-            assertArrayEquals(b("nowe"), db.get(b("k")).orElseThrow());
+            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow());
         }
         try (LsmStore db = LsmStore.open(dir)) {
-            assertArrayEquals(b("nowe"), db.get(b("k")).orElseThrow());
+            assertArrayEquals(b("new"), db.get(b("k")).orElseThrow());
         }
     }
 
@@ -405,9 +405,9 @@ class LsmStoreTest {
             db.put(b("k"), b("v"));
             db.flush();
             db.compact();
-            assertEquals(1, db.sstableCount(), "jedna tabela nie ma sie z czym scalac");
+            assertEquals(1, db.sstableCount(), "a single table has nothing to merge with");
         }
-        assertEquals(1, sstFiles(dir).size(), "brak przepisanego pliku obok starego");
+        assertEquals(1, sstFiles(dir).size(), "no rewritten file sitting next to the old one");
     }
 
     @Test
@@ -418,11 +418,11 @@ class LsmStoreTest {
                 if (i % 5 == 4) db.flush();
             }
             for (int i = 0; i < 30; i += 3) {
-                db.put(b("k" + i), b("nadpisane" + i)); // co trzeci nadpisany
+                db.put(b("k" + i), b("overwritten" + i)); // every third one overwritten
             }
             db.flush();
             for (int i = 0; i < 30; i += 7) {
-                db.delete(b("k" + i)); // co siodmy skasowany
+                db.delete(b("k" + i)); // every seventh one deleted
             }
             db.flush();
             db.compact();
@@ -430,9 +430,9 @@ class LsmStoreTest {
             assertEquals(1, db.sstableCount());
             for (int i = 0; i < 30; i++) {
                 if (i % 7 == 0) {
-                    assertTrue(db.get(b("k" + i)).isEmpty(), "k" + i + " skasowany");
+                    assertTrue(db.get(b("k" + i)).isEmpty(), "k" + i + " deleted");
                 } else if (i % 3 == 0) {
-                    assertArrayEquals(b("nadpisane" + i), db.get(b("k" + i)).orElseThrow(), "k" + i);
+                    assertArrayEquals(b("overwritten" + i), db.get(b("k" + i)).orElseThrow(), "k" + i);
                 } else {
                     assertArrayEquals(b("v" + i), db.get(b("k" + i)).orElseThrow(), "k" + i);
                 }
@@ -440,7 +440,7 @@ class LsmStoreTest {
         }
     }
 
-    /** Stan po dwoch zrzutach: sst-000000 z wartoscia, sst-000001 z przykrywajacym ja tombstone'em. */
+    /** State after two flushes: sst-000000 with a value, sst-000001 with the tombstone hiding it. */
     private static void valueThenTombstoneInSeparateTables(Path dir) {
         try (LsmStore db = LsmStore.open(dir)) {
             db.put(b("k"), b("v"));
@@ -453,28 +453,28 @@ class LsmStoreTest {
     @Test
     void crashBetweenMergeAndCleanupKeepsStoreCorrect(@TempDir Path dir) throws IOException {
         valueThenTombstoneInSeparateTables(dir);
-        // Scalenie daje pusty wynik, wiec zaden nowy plik nie powstaje. Symulujemy crash w polowie
-        // sprzatania: compact() kasuje od najstarszej, wiec zdazyla zniknac tylko sst-000000.
+        // The merge yields an empty result, so no new file appears. We simulate a crash halfway
+        // through cleanup: compact() deletes oldest-first, so only sst-000000 had time to go.
         Files.delete(dir.resolve("sst-000000.sst"));
 
         try (LsmStore db = LsmStore.open(dir)) {
-            assertTrue(db.get(b("k")).isEmpty(), "ocalaly tombstone dalej trzyma klucz skasowany");
+            assertTrue(db.get(b("k")).isEmpty(), "the surviving tombstone still keeps the key deleted");
         }
     }
 
     @Test
     void deletingNewerTableFirstWouldResurrectDeletedKey(@TempDir Path dir) throws IOException {
         valueThenTombstoneInSeparateTables(dir);
-        // Ta sama sytuacja, ale sprzatanie poszlo od nowszej tabeli — czyli odwrotnie niz compact().
+        // Same situation, but cleanup started from the newer table — the opposite of compact().
         Files.delete(dir.resolve("sst-000001.sst"));
 
         try (LsmStore db = LsmStore.open(dir)) {
             assertArrayEquals(b("v"), db.get(b("k")).orElseThrow(),
-                    "bez tombstone'a wraca stara wartosc — dlatego compact() kasuje od najstarszej");
+                    "without the tombstone the old value returns — hence compact() deletes oldest-first");
         }
     }
 
-    // ---- M5: odpornosc i nastawy -------------------------------------------
+    // ---- M5: robustness and settings ---------------------------------------
 
     @Test
     void storeOpensAfterCrashInTheMiddleOfAWrite(@TempDir Path dir) throws IOException {
@@ -482,16 +482,16 @@ class LsmStoreTest {
             db.put(b("a"), b("1"));
             db.put(b("b"), b("2"));
         }
-        // Crash w polowie trzeciego zapisu: ostatni rekord w logu jest niekompletny.
+        // A crash halfway through the third write: the last record in the log is incomplete.
         Path log = dir.resolve("wal.log");
         byte[] full = Files.readAllBytes(log);
         Files.write(log, java.util.Arrays.copyOf(full, full.length - 2));
 
         try (LsmStore db = LsmStore.open(dir)) {
-            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "potwierdzone zapisy przetrwaly");
-            assertTrue(db.get(b("b")).isEmpty(), "niedokonczony zapis nie zostal nigdy potwierdzony");
+            assertArrayEquals(b("1"), db.get(b("a")).orElseThrow(), "acknowledged writes survived");
+            assertTrue(db.get(b("b")).isEmpty(), "the unfinished write was never acknowledged");
 
-            db.put(b("c"), b("3")); // sklep musi byc dalej zdatny do uzytku
+            db.put(b("c"), b("3")); // the store must remain usable
             assertArrayEquals(b("3"), db.get(b("c")).orElseThrow());
         }
         try (LsmStore db = LsmStore.open(dir)) {
@@ -504,11 +504,11 @@ class LsmStoreTest {
         LsmStore.Options buffered = options().withDurability(Wal.Durability.OS_BUFFERED);
         try (LsmStore db = LsmStore.open(dir, buffered)) {
             db.put(b("k"), b("v"));
-            db.delete(b("usuniety"));
+            db.delete(b("removed"));
         }
         try (LsmStore db = LsmStore.open(dir, buffered)) {
             assertArrayEquals(b("v"), db.get(b("k")).orElseThrow());
-            assertTrue(db.get(b("usuniety")).isEmpty());
+            assertTrue(db.get(b("removed")).isEmpty());
         }
     }
 
@@ -522,17 +522,17 @@ class LsmStoreTest {
     @Test
     void compactionCoexistsWithUnflushedMemtable(@TempDir Path dir) {
         try (LsmStore db = LsmStore.open(dir)) {
-            db.put(b("k"), b("stare"));
+            db.put(b("k"), b("old"));
             db.flush();
             db.put(b("inny"), b("x"));
             db.flush();
 
-            db.put(b("k"), b("swieze")); // zostaje w memtable, poza scalaniem
+            db.put(b("k"), b("fresh")); // stays in the memtable, outside the merge
             db.compact();
 
             assertEquals(1, db.sstableCount());
-            assertArrayEquals(b("swieze"), db.get(b("k")).orElseThrow(),
-                    "memtable dalej bije scalona tabele");
+            assertArrayEquals(b("fresh"), db.get(b("k")).orElseThrow(),
+                    "the memtable still beats the merged table");
             assertArrayEquals(b("x"), db.get(b("inny")).orElseThrow());
         }
     }

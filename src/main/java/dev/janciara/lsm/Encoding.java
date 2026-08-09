@@ -10,29 +10,29 @@ import java.io.UncheckedIOException;
 import java.util.OptionalLong;
 
 /**
- * Serializacja rekordow do/z strumieni bajtow.
+ * Serialisation of records to and from byte streams.
  *
- * <p>Format jednego rekordu na dysku:
+ * <p>On-disk format of a single record:
  * <pre>
  *   uvarint(keyLen) | key[keyLen] | byte(tombstone) | uvarint(seqNo) | uvarint(valLen) | value[valLen]
  * </pre>
  *
- * <p>Liczby koduje sie jako <b>unsigned LEB128 varint</b> — male wartosci (typowe dlugosci,
- * poczatkowe seqNo) zajmuja 1 bajt zamiast 8. To samo kodowanie uzywa Protobuf i LevelDB.
+ * <p>Numbers are encoded as <b>unsigned LEB128 varints</b> — small values (typical lengths, early
+ * seqNos) take 1 byte instead of 8. Protobuf and LevelDB use the same encoding.
  *
- * <p>API strumieniowe ({@link #writeRecord}/{@link #readRecord}) jest celowe: WAL (M1) bedzie
- * dopisywal rekordy jeden po drugim, a replay przeczyta je az do EOF ({@code readRecord}
- * zwraca {@code null} na czystym koncu strumienia).
+ * <p>The streaming API ({@link #writeRecord}/{@link #readRecord}) is deliberate: the WAL appends
+ * records one after another, and replay reads them until EOF ({@code readRecord} returns
+ * {@code null} at a clean end of stream).
  */
 public final class Encoding {
 
     /**
-     * Gorny limit dlugosci klucza i wartosci (64 MiB).
+     * Upper bound on key and value length (64 MiB).
      *
-     * <p>Nie chodzi o oszczedzanie miejsca, tylko o to, zeby uszkodzony varint nie zamienil sie
-     * w {@code new byte[2_000_000_000]}. Bez tej granicy jeden przekrecony bit w pliku konczy sie
-     * OutOfMemoryError zamiast czytelnym bledem — a to roznica miedzy „plik jest zepsuty"
-     * a „proces padl". Limit obowiazuje symetrycznie przy zapisie i odczycie.
+     * <p>This is not about saving space; it is about stopping a corrupted varint from becoming
+     * {@code new byte[2_000_000_000]}. Without the bound, a single flipped bit in a file ends in an
+     * OutOfMemoryError instead of a readable error — the difference between "the file is broken"
+     * and "the process died". The limit applies symmetrically on write and on read.
      */
     public static final int MAX_BLOB_LENGTH = 64 * 1024 * 1024;
 
@@ -40,9 +40,9 @@ public final class Encoding {
 
     // ---- varint -------------------------------------------------------------
 
-    /** Zapis liczby jako unsigned LEB128 (7 bitow na bajt, MSB = "jest kolejny bajt"). */
+    /** Writes a number as unsigned LEB128 (7 bits per byte, MSB = "another byte follows"). */
     public static void writeUVarLong(OutputStream out, long value) throws IOException {
-        // traktujemy jako unsigned: ~0x7F maskuje wszystkie bity poza dolna siodemka
+        // treated as unsigned: ~0x7F masks off everything but the low seven bits
         while ((value & ~0x7FL) != 0) {
             out.write((int) ((value & 0x7F) | 0x80));
             value >>>= 7;
@@ -50,7 +50,7 @@ public final class Encoding {
         out.write((int) (value & 0x7F));
     }
 
-    /** Odczyt varinta. Rzuca {@link EOFException} jesli strumien sie urwie (takze przed 1. bajtem). */
+    /** Reads a varint. Throws {@link EOFException} if the stream ends, including before byte 1. */
     public static long readUVarLong(InputStream in) throws IOException {
         int b = in.read();
         if (b < 0) throw new EOFException("unexpected EOF at start of varint");
@@ -58,12 +58,12 @@ public final class Encoding {
     }
 
     /**
-     * Jak {@link #readUVarLong}, ale toleruje czysty koniec strumienia: zwraca pusty
-     * {@link OptionalLong} gdy {@code in} skonczyl sie przed 1. bajtem. Uzywane przez
-     * {@link #readRecord} do wykrycia konca logu/pliku.
+     * Like {@link #readUVarLong}, but tolerates a clean end of stream: returns an empty
+     * {@link OptionalLong} when {@code in} ended before the first byte. Used by
+     * {@link #readRecord} to detect the end of a log or file.
      *
-     * <p>Wazne: EOF jest sygnalizowany przez <i>pustosc</i> Optionala, nie przez wartosc —
-     * dzieki temu varint dekodujacy sie do -1L (unsigned max) nie jest mylony z koncem strumienia.
+     * <p>Important: EOF is signalled by the Optional being <i>empty</i>, not by a value — so a
+     * varint decoding to -1L (unsigned max) is never mistaken for the end of the stream.
      */
     private static OptionalLong readUVarLongOrEof(InputStream in) throws IOException {
         int b = in.read();
@@ -71,7 +71,7 @@ public final class Encoding {
         return OptionalLong.of(readUVarLongBody(in, b));
     }
 
-    /** Dekoduje reszte varinta majac juz pierwszy bajt. */
+    /** Decodes the rest of a varint given its first byte. */
     private static long readUVarLongBody(InputStream in, int firstByte) throws IOException {
         long result = firstByte & 0x7F;
         if ((firstByte & 0x80) == 0) return result;
@@ -91,7 +91,7 @@ public final class Encoding {
     public static void writeBlob(OutputStream out, byte[] b) throws IOException {
         if (b.length > MAX_BLOB_LENGTH) {
             throw new IllegalArgumentException(
-                    "blob dluzszy niz limit " + MAX_BLOB_LENGTH + " B: " + b.length);
+                    "blob longer than the " + MAX_BLOB_LENGTH + " B limit: " + b.length);
         }
         writeUVarLong(out, b.length);
         out.write(b);
@@ -102,13 +102,13 @@ public final class Encoding {
     }
 
     /**
-     * Czyta {@code len} bajtow, ale najpierw sprawdza, czy ta dlugosc jest w ogole wiarygodna.
-     * Varint moze zdekodowac sie do liczby ujemnej (ustawiony bit 63) albo absurdalnie duzej —
-     * jedno i drugie to uszkodzony plik, a nie powod do alokacji.
+     * Reads {@code len} bytes, but first checks whether that length is believable at all. A varint
+     * can decode to a negative number (bit 63 set) or an absurdly large one — either means a
+     * corrupted file, not a reason to allocate.
      */
     private static byte[] readBytes(InputStream in, long len, String what) throws IOException {
         if (len < 0 || len > MAX_BLOB_LENGTH) {
-            throw new IOException("nierealna dlugosc pola " + what + " (" + len + ") — uszkodzony plik");
+            throw new IOException("implausible length for field " + what + " (" + len + ") — corrupt file");
         }
         byte[] b = new byte[(int) len];
         int read = in.readNBytes(b, 0, (int) len);
@@ -125,10 +125,10 @@ public final class Encoding {
         writeBlob(out, r.value());
     }
 
-    /** Odczyt jednego rekordu. Zwraca {@code null} gdy strumien skonczyl sie czysto (brak kolejnego rekordu). */
+    /** Reads one record. Returns {@code null} when the stream ended cleanly (no further record). */
     public static Record readRecord(InputStream in) throws IOException {
         OptionalLong keyLen = readUVarLongOrEof(in);
-        if (keyLen.isEmpty()) return null; // czysty koniec strumienia
+        if (keyLen.isEmpty()) return null; // clean end of stream
         byte[] key = readBytes(in, keyLen.getAsLong(), "key");
 
         int tomb = in.read();
@@ -139,14 +139,14 @@ public final class Encoding {
         return new Record(key, value, tomb != 0, seqNo);
     }
 
-    // ---- convenience (caly rekord <-> byte[]) ------------------------------
+    // ---- convenience (whole record <-> byte[]) ------------------------------
 
     public static byte[] serialize(Record r) {
         var bos = new ByteArrayOutputStream();
         try {
             writeRecord(bos, r);
         } catch (IOException e) {
-            throw new UncheckedIOException(e); // ByteArrayOutputStream nie rzuca realnie
+            throw new UncheckedIOException(e); // ByteArrayOutputStream never actually throws
         }
         return bos.toByteArray();
     }

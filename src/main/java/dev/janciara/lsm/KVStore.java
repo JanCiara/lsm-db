@@ -3,24 +3,23 @@ package dev.janciara.lsm;
 import java.util.Optional;
 
 /**
- * Publiczny kontrakt silnika klucz-wartosc.
+ * The public contract of the key-value engine.
  *
- * <p>Klucze i wartosci to surowe bajty — silnik nie narzuca kodowania.
- * Implementacja (LsmStore) bedzie dodana w M1+. W M0 definiujemy tylko ksztalt API,
- * zeby reszta projektu miala stabilny punkt zaczepienia.
+ * <p>Keys and values are raw bytes — the engine imposes no encoding. {@link LsmStore} is the
+ * implementation; this interface exists so the rest of the project has a stable anchor point.
  */
 public interface KVStore extends AutoCloseable {
 
-    /** Zapisuje (lub nadpisuje) wartosc dla klucza. */
+    /** Stores (or overwrites) the value for a key. */
     void put(byte[] key, byte[] value);
 
-    /** Zwraca aktualna wartosc klucza, lub empty jesli nie istnieje / zostal usuniety. */
+    /** Returns the current value of a key, or empty if it does not exist / was deleted. */
     Optional<byte[]> get(byte[] key);
 
-    /** Usuwa klucz (logicznie — wewnetrznie zapisze tombstone). */
+    /** Deletes a key (logically — internally this writes a tombstone). */
     void delete(byte[] key);
 
-    /** Flush + zamkniecie zasobow (WAL, otwarte pliki). Nie rzuca checked exceptions. */
+    /** Flush + release resources (WAL, open files). Throws no checked exceptions. */
     @Override
     void close();
 }

@@ -20,11 +20,11 @@ import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 
 /**
- * Ile kosztuje jeden {@code put} i skad ten koszt pochodzi.
+ * What a single {@code put} costs, and where that cost comes from.
  *
- * <p>Glowne pytanie M5: czy fsync po kazdym rekordzie faktycznie przebija cala reszte silnika.
- * Dlatego ten sam zapis mierzymy w dwoch trybach trwalosci — {@code SYNC} (rekord na talerzu
- * dysku) i {@code OS_BUFFERED} (rekord w cache OS-a).
+ * <p>The main M5 question: does an fsync per record really outweigh the whole rest of the engine?
+ * That is why the same write is measured in both durability modes — {@code SYNC} (record on the
+ * platter) and {@code OS_BUFFERED} (record in the OS cache).
  */
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.AverageTime)
@@ -53,29 +53,29 @@ public class WriteBenchmark {
         deleteRecursively(dir);
     }
 
-    /** Klucze rosnace — najlepszy przypadek dla memtable (wstawianie na koniec drzewa). */
+    /** Ascending keys — the best case for the memtable (inserting at the end of the tree). */
     @Benchmark
     public void sequentialPut() {
         store.put(key(counter++), value);
     }
 
-    /** Klucze rozrzucone — memtable musi realnie szukac miejsca w drzewie. */
+    /** Scattered keys — the memtable actually has to find a place in the tree. */
     @Benchmark
     public void randomPut() {
         store.put(key(scramble(counter++)), value);
     }
 
-    /** Usuniecie to zwykly zapis — mierzymy, czy faktycznie kosztuje tyle samo co put. */
+    /** A deletion is an ordinary write — we measure whether it really costs the same as a put. */
     @Benchmark
     public void delete() {
         store.delete(key(counter++));
     }
 
     private static byte[] key(long i) {
-        return String.format("klucz:%012d", i).getBytes(StandardCharsets.UTF_8);
+        return String.format("key:%012d", i).getBytes(StandardCharsets.UTF_8);
     }
 
-    /** Tani mieszacz bitow — rozrzuca kolejne liczby po calej przestrzeni kluczy. */
+    /** A cheap bit mixer — scatters consecutive numbers across the whole key space. */
     private static long scramble(long i) {
         long z = i * 0x9e3779b97f4a7c15L;
         z = (z ^ (z >>> 30)) * 0xbf58476d1ce4e5b9L;

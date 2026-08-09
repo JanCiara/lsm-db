@@ -8,26 +8,26 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 /**
- * Filtr Blooma — probabilistyczny zbior odpowiadajacy na jedno pytanie: „czy tego klucza na pewno
- * tu nie ma?".
+ * A Bloom filter — a probabilistic set answering exactly one question: "is this key definitely not
+ * here?"
  *
- * <p>Odpowiedz {@code false} z {@link #mightContain} jest <b>pewna</b>: klucza nie ma.
- * Odpowiedz {@code true} moze byc falszywym alarmem i wymaga sprawdzenia na dysku. Falszywych
- * negatywow nie ma z konstrukcji — dodanie klucza zapala bity, ktore nigdy nie gasna.
+ * <p>A {@code false} from {@link #mightContain} is <b>certain</b>: the key is absent. A
+ * {@code true} may be a false alarm and needs checking on disk. There are no false negatives by
+ * construction — adding a key sets bits that are never cleared.
  *
- * <p>Po co to w LSM: chybiony odczyt musi odwiedzic <b>kazda</b> tabele, bo brak klucza w jednej
- * nic nie mowi o pozostalych. Filtr trzymany w pamieci zbija te wizyty do zera dla wiekszosci
- * tabel, zamieniajac odczyt z dysku na kilka operacji na bitach.
+ * <p>Why an LSM wants this: a missed read has to visit <b>every</b> table, because the absence of a
+ * key in one says nothing about the others. Keeping the filter in memory drops those visits to zero
+ * for most tables, turning a disk read into a handful of bit operations.
  *
- * <p>Rozmiar: {@value #DEFAULT_BITS_PER_KEY} bitow na klucz i {@code k = bity * ln2} funkcji
- * mieszajacych to okolice minimum bledu dla tego rozmiaru — ok. 1% falszywych trafien przy ~1,25 B
- * na klucz. Zamiast liczyc {@code k} niezaleznych hashy uzywamy podwojnego haszowania
- * (Kirsch-Mitzenmacher): {@code h_i = h1 + i*h2}. Daje to praktycznie ten sam rozklad przy koszcie
- * jednego hasha, i tak samo robia to prawdziwe silniki.
+ * <p>Sizing: {@value #DEFAULT_BITS_PER_KEY} bits per key and {@code k = bits * ln2} hash functions
+ * sit near the error minimum for that size — about 1% false positives at ~1.25 B per key. Instead
+ * of computing {@code k} independent hashes we use double hashing (Kirsch-Mitzenmacher):
+ * {@code h_i = h1 + i*h2}. That gives practically the same distribution at the cost of one hash,
+ * and it is what real engines do too.
  */
 public final class BloomFilter {
 
-    /** Kompromis rozmiar/blad: ~1% falszywych trafien. */
+    /** Size/error trade-off: ~1% false positives. */
     static final int DEFAULT_BITS_PER_KEY = 10;
 
     private final long[] words;
@@ -41,19 +41,19 @@ public final class BloomFilter {
     }
 
     /**
-     * Buduje filtr z gotowych hashy kluczy — {@link SSTable.Writer} liczy je w locie, bo w chwili
-     * zapisu pierwszego rekordu nie wie jeszcze, ilu kluczy sie doczeka, a rozmiar filtra zalezy
-     * wlasnie od tej liczby.
+     * Builds a filter from precomputed key hashes — {@link SSTable.Writer} accumulates them as it
+     * goes, because when the first record is written it does not yet know how many keys will
+     * follow, and the filter's size depends on exactly that number.
      *
-     * @param count ile poczatkowych pozycji {@code keyHashes} jest realnie wypelnionych
+     * @param count how many leading positions of {@code keyHashes} are actually populated
      */
     public static BloomFilter build(long[] keyHashes, int count) {
         return build(keyHashes, count, DEFAULT_BITS_PER_KEY);
     }
 
     static BloomFilter build(long[] keyHashes, int count, int bitsPerKey) {
-        if (count < 0 || count > keyHashes.length) throw new IllegalArgumentException("bledny count");
-        if (bitsPerKey < 1) throw new IllegalArgumentException("bitsPerKey musi byc >= 1");
+        if (count < 0 || count > keyHashes.length) throw new IllegalArgumentException("bad count");
+        if (bitsPerKey < 1) throw new IllegalArgumentException("bitsPerKey must be >= 1");
 
         int bitCount = Math.max(64, count * bitsPerKey);
         int hashCount = Math.max(1, Math.min(30, (int) Math.round(bitsPerKey * Math.log(2))));
@@ -64,7 +64,7 @@ public final class BloomFilter {
         return filter;
     }
 
-    /** {@code false} = klucza na pewno nie ma. {@code true} = moze byc, trzeba sprawdzic. */
+    /** {@code false} = the key is definitely absent. {@code true} = maybe present, go and check. */
     public boolean mightContain(byte[] key) {
         return mightContainHash(hash(key));
     }
@@ -88,7 +88,7 @@ public final class BloomFilter {
         }
     }
 
-    /** FNV-1a 64 — prosty, szybki i wystarczajaco dobrze miesza jak na filtr. */
+    /** FNV-1a 64 — simple, fast, and mixes well enough for a filter. */
     public static long hash(byte[] key) {
         long h = 0xcbf29ce484222325L;
         for (byte b : key) {
@@ -99,8 +99,8 @@ public final class BloomFilter {
     }
 
     /**
-     * Drugi hash do podwojnego haszowania. Nieparzysty, zeby przy potedze dwojki jako liczbie
-     * bitow kolejne probki nie wpadaly w krotki cykl.
+     * The second hash for double hashing. Forced odd so that, when the bit count is a power of two,
+     * successive probes do not fall into a short cycle.
      */
     private static long step(long keyHash) {
         long z = keyHash;
@@ -110,7 +110,7 @@ public final class BloomFilter {
     }
 
     private int bitIndex(long probe) {
-        return (int) Long.remainderUnsigned(probe, bitCount); // probe traktujemy jako unsigned
+        return (int) Long.remainderUnsigned(probe, bitCount); // probe is treated as unsigned
     }
 
     private int wordIndex(long probe) {
@@ -121,7 +121,7 @@ public final class BloomFilter {
         return 1L << (bitIndex(probe) & 63);
     }
 
-    // ---- serializacja --------------------------------------------------------
+    // ---- serialisation -------------------------------------------------------
 
     void writeTo(OutputStream out) throws IOException {
         Encoding.writeUVarLong(out, bitCount);
@@ -139,13 +139,13 @@ public final class BloomFilter {
         int hashCount = Math.toIntExact(Encoding.readUVarLong(in));
         int wordCount = Math.toIntExact(Encoding.readUVarLong(in));
         if (bitCount <= 0 || hashCount <= 0 || wordCount != (bitCount + 63) / 64) {
-            throw new IOException("uszkodzony filtr Blooma: bity=" + bitCount
-                    + ", hashe=" + hashCount + ", slowa=" + wordCount);
+            throw new IOException("corrupt Bloom filter: bits=" + bitCount
+                    + ", hashes=" + hashCount + ", words=" + wordCount);
         }
 
         byte[] raw = in.readNBytes(wordCount * Long.BYTES);
         if (raw.length != wordCount * Long.BYTES) {
-            throw new EOFException("uciety filtr Blooma");
+            throw new EOFException("truncated Bloom filter");
         }
         ByteBuffer buf = ByteBuffer.wrap(raw);
         long[] words = new long[wordCount];
@@ -163,14 +163,14 @@ public final class BloomFilter {
         return hashCount;
     }
 
-    /** Rozmiar na dysku/w pamieci, bez naglowkow. */
+    /** Size on disk / in memory, excluding headers. */
     public int byteSize() {
         return words.length * Long.BYTES;
     }
 
     @Override
     public String toString() {
-        return "BloomFilter[" + bitCount + " bitow, " + hashCount + " hashy, "
-                + Arrays.stream(words).filter(w -> w != 0).count() + " niepustych slow]";
+        return "BloomFilter[" + bitCount + " bits, " + hashCount + " hashes, "
+                + Arrays.stream(words).filter(w -> w != 0).count() + " non-empty words]";
     }
 }

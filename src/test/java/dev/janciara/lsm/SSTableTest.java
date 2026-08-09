@@ -23,15 +23,16 @@ import org.junit.jupiter.api.io.TempDir;
 class SSTableTest {
 
     /**
-     * Kazda otwarta tabela trzyma kanal do pliku az do {@code close()}. Testy tworza je hurtowo,
-     * wiec zbieramy je tutaj i zamykamy po kazdym tescie — zamiast rozsiewac try-with-resources.
+     * Every opened table holds a file channel until {@code close()}. These tests create them in
+     * bulk, so we collect them here and close them after each test instead of sprinkling
+     * try-with-resources everywhere.
      */
     private final List<SSTable> opened = new ArrayList<>();
 
     @AfterEach
     void closeOpenedTables() throws IOException {
         for (SSTable t : opened) {
-            t.close(); // idempotentne, wiec tabele skasowane w tescie tez sa tu bezpieczne
+            t.close(); // idempotent, so tables deleted inside a test are safe here too
         }
     }
 
@@ -55,7 +56,7 @@ class SSTableTest {
         return s.getBytes(StandardCharsets.UTF_8);
     }
 
-    /** Zapis przez memtable, zeby wejscie bylo posortowane tak jak w prawdziwym zrzucie. */
+    /** Writes through a memtable so the input is sorted exactly as in a real flush. */
     private SSTable writeTable(Path file, Record... records) throws IOException {
         var mt = new MemTable();
         for (Record r : records) mt.put(r);
@@ -80,12 +81,12 @@ class SSTableTest {
                 Record.value(b("b"), b("2"), 0),
                 Record.value(b("d"), b("4"), 1));
 
-        assertTrue(t.get(b("c")).isEmpty(), "dziura w srodku zakresu");
-        assertTrue(t.get(b("a")).isEmpty(), "przed minKey");
-        assertTrue(t.get(b("z")).isEmpty(), "za maxKey");
-        assertFalse(t.mightContain(b("z")), "odsiew po zakresie kluczy");
-        assertFalse(t.mightContain(b("c")), "dziure w srodku zakresu lapie dopiero filtr Blooma");
-        assertTrue(t.mightContain(b("b")), "istniejacy klucz nigdy nie jest odsiany");
+        assertTrue(t.get(b("c")).isEmpty(), "a hole in the middle of the range");
+        assertTrue(t.get(b("a")).isEmpty(), "before minKey");
+        assertTrue(t.get(b("z")).isEmpty(), "past maxKey");
+        assertFalse(t.mightContain(b("z")), "rejected by the key range");
+        assertFalse(t.mightContain(b("c")), "a hole inside the range is only caught by the Bloom filter");
+        assertTrue(t.mightContain(b("b")), "an existing key is never rejected");
     }
 
     @Test
@@ -93,7 +94,7 @@ class SSTableTest {
         SSTable t = writeTable(dir.resolve("t.sst"), Record.tombstone(b("k"), 7));
 
         Record r = t.get(b("k")).orElseThrow();
-        assertTrue(r.tombstone(), "SSTable oddaje rekord jak lezy — tlumaczenie to rola LsmStore");
+        assertTrue(r.tombstone(), "the SSTable hands the record back as-is — translating is LsmStore's job");
         assertEquals(7, r.seqNo());
     }
 
@@ -107,7 +108,7 @@ class SSTableTest {
 
         SSTable reopened = open(file);
         assertEquals(3, reopened.entryCount());
-        assertEquals(9, reopened.maxSeqNo(), "stopka pamieta najwyzszy seqNo, nie ostatni zapisany");
+        assertEquals(9, reopened.maxSeqNo(), "the footer remembers the highest seqNo, not the last written");
         assertArrayEquals(b("a"), reopened.minKey());
         assertArrayEquals(b("z"), reopened.maxKey());
         assertArrayEquals(b("2"), reopened.get(b("m")).orElseThrow().value());
@@ -136,7 +137,7 @@ class SSTableTest {
                 Record.value(hi, b("hi"), 1),
                 Record.value(lo, b("lo"), 0));
 
-        assertArrayEquals(lo, t.minKey(), "0x7F < 0x80 w porzadku unsigned");
+        assertArrayEquals(lo, t.minKey(), "0x7F < 0x80 in unsigned order");
         assertArrayEquals(hi, t.maxKey());
         assertArrayEquals(b("hi"), t.get(hi).orElseThrow().value());
     }
@@ -185,7 +186,7 @@ class SSTableTest {
         try (var ls = Files.list(dir)) {
             ls.forEach(p -> names.add(p.getFileName().toString()));
         }
-        assertEquals(List.of("t.sst"), names, "po atomowej podmianie zostaje tylko plik docelowy");
+        assertEquals(List.of("t.sst"), names, "after the atomic swap only the target file remains");
     }
 
     @Test
@@ -194,7 +195,7 @@ class SSTableTest {
         writeTable(file, Record.value(b("k"), b("v"), 0));
 
         byte[] full = Files.readAllBytes(file);
-        Files.write(file, Arrays.copyOf(full, full.length - 3)); // urwany ogon = brak magic
+        Files.write(file, Arrays.copyOf(full, full.length - 3)); // torn tail = no trailing magic
 
         assertThrows(IOException.class, () -> SSTable.open(file));
     }
@@ -227,11 +228,11 @@ class SSTableTest {
 
         try (SSTable.Cursor cursor = t.cursor()) {
             assertArrayEquals(b("a"), cursor.peek().key());
-            assertArrayEquals(b("a"), cursor.peek().key(), "peek nie przesuwa kursora");
+            assertArrayEquals(b("a"), cursor.peek().key(), "peek does not move the cursor");
             cursor.advance();
             assertArrayEquals(b("b"), cursor.peek().key());
             cursor.advance();
-            assertNull(cursor.peek(), "null oznacza koniec tabeli");
+            assertNull(cursor.peek(), "null means the end of the table");
         }
     }
 
@@ -240,31 +241,31 @@ class SSTableTest {
         Path file = dir.resolve("t.sst");
         try (SSTable.Writer writer = SSTable.writer(file)) {
             writer.add(Record.value(b("a"), b("1"), 0));
-            // brak finish() — symuluje wyjatek w polowie scalania
+            // no finish() — simulates an exception in the middle of a merge
         }
 
-        assertFalse(Files.exists(file), "docelowy plik nie powstaje");
-        assertFalse(Files.exists(dir.resolve("t.sst.tmp")), "smiec po sobie posprzatany");
+        assertFalse(Files.exists(file), "the target file is never created");
+        assertFalse(Files.exists(dir.resolve("t.sst.tmp")), "the writer cleaned up after itself");
     }
 
-    // ---- M3: scalanie ------------------------------------------------------
+    // ---- M3: merging -------------------------------------------------------
 
     @Test
     void compactKeepsNewestVersionOfEachKey(@TempDir Path dir) throws IOException {
         SSTable older = writeTable(dir.resolve("0.sst"),
-                Record.value(b("a"), b("stare-a"), 0),
-                Record.value(b("b"), b("stare-b"), 1));
+                Record.value(b("a"), b("old-a"), 0),
+                Record.value(b("b"), b("old-b"), 1));
         SSTable newer = writeTable(dir.resolve("1.sst"),
-                Record.value(b("b"), b("nowe-b"), 2),
-                Record.value(b("c"), b("nowe-c"), 3));
+                Record.value(b("b"), b("new-b"), 2),
+                Record.value(b("c"), b("new-c"), 3));
 
         SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
 
         List<Record> all = merged.readAll();
-        assertEquals(3, all.size(), "wspolny klucz zostaje raz");
-        assertArrayEquals(b("stare-a"), all.get(0).value());
-        assertArrayEquals(b("nowe-b"), all.get(1).value(), "wygrywa wersja z nowszej tabeli");
-        assertArrayEquals(b("nowe-c"), all.get(2).value());
+        assertEquals(3, all.size(), "the shared key survives once");
+        assertArrayEquals(b("old-a"), all.get(0).value());
+        assertArrayEquals(b("new-b"), all.get(1).value(), "the newer table's version wins");
+        assertArrayEquals(b("new-c"), all.get(2).value());
         assertEquals(3, merged.maxSeqNo());
     }
 
@@ -290,15 +291,15 @@ class SSTableTest {
     @Test
     void compactDropsTombstonesWhenMergingEverything(@TempDir Path dir) throws IOException {
         SSTable older = writeTable(dir.resolve("0.sst"),
-                Record.value(b("zyje"), b("v"), 0),
-                Record.value(b("znika"), b("v"), 1));
-        SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("znika"), 2));
+                Record.value(b("survives"), b("v"), 0),
+                Record.value(b("vanishes"), b("v"), 1));
+        SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("vanishes"), 2));
 
         SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
 
         List<Record> all = merged.readAll();
-        assertEquals(1, all.size(), "i wartosc, i przykrywajacy ja tombstone znikaja");
-        assertArrayEquals(b("zyje"), all.get(0).key());
+        assertEquals(1, all.size(), "both the value and the tombstone hiding it are gone");
+        assertArrayEquals(b("survives"), all.get(0).key());
     }
 
     @Test
@@ -306,12 +307,12 @@ class SSTableTest {
         SSTable older = writeTable(dir.resolve("0.sst"), Record.value(b("k"), b("v"), 0));
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("k"), 1));
 
-        // dropTombstones=false: pod spodem moze lezec starsza tabela, ktorej tombstone wciaz pilnuje
+        // dropTombstones=false: an older table may lie underneath, still guarded by this tombstone
         SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), false).orElseThrow();
 
         List<Record> all = merged.readAll();
         assertEquals(1, all.size());
-        assertTrue(all.get(0).tombstone(), "tombstone przepisany, nie wyrzucony");
+        assertTrue(all.get(0).tombstone(), "the tombstone was copied through, not discarded");
     }
 
     @Test
@@ -321,17 +322,17 @@ class SSTableTest {
 
         Path target = dir.resolve("2.sst");
         assertTrue(compact(target, List.of(older, newer), true).isEmpty());
-        assertFalse(Files.exists(target), "pusta tabela nie zostawia pliku");
+        assertFalse(Files.exists(target), "an empty table leaves no file behind");
         assertFalse(Files.exists(dir.resolve("2.sst.tmp")));
     }
 
-    // ---- M4: indeks blokowy i filtr Blooma ---------------------------------
+    // ---- M4: block index and Bloom filter -----------------------------------
 
-    /** Tabela wyraznie wieksza niz jeden blok: 200 rekordow po ~120 B to ~24 KiB. */
+    /** A table clearly bigger than one block: 200 records of ~120 B is ~24 KiB. */
     private SSTable multiBlockTable(Path file) throws IOException {
         var mt = new MemTable();
         for (int i = 0; i < 200; i++) {
-            mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
+            mt.put(Record.value(b(String.format("key:%04d", i)), b("v".repeat(120)), i));
         }
         return track(SSTable.write(file, mt.snapshot()));
     }
@@ -340,35 +341,35 @@ class SSTableTest {
     void largeTableIsSplitIntoSeveralBlocks(@TempDir Path dir) throws IOException {
         SSTable t = multiBlockTable(dir.resolve("t.sst"));
 
-        assertTrue(t.blockCount() > 1, "24 KiB danych nie miesci sie w jednym 4 KiB bloku");
+        assertTrue(t.blockCount() > 1, "24 KiB of data does not fit in a single 4 KiB block");
         assertEquals(t.blockCount(), open(dir.resolve("t.sst")).blockCount(),
-                "indeks odtworzony ze stopki bez zmian");
+                "the index was restored from the footer unchanged");
     }
 
     @Test
     void everyKeyIsFoundThroughTheIndex(@TempDir Path dir) throws IOException {
         multiBlockTable(dir.resolve("t.sst"));
-        SSTable t = open(dir.resolve("t.sst")); // czytamy przez indeks z pliku, nie z pamieci writera
+        SSTable t = open(dir.resolve("t.sst")); // read via the on-disk index, not the writer's memory
 
         for (int i = 0; i < 200; i++) {
-            String key = String.format("klucz:%04d", i);
+            String key = String.format("key:%04d", i);
             assertArrayEquals(b("v".repeat(120)), t.get(b(key)).orElseThrow().value(), key);
         }
-        assertTrue(t.get(b("klucz:0200")).isEmpty(), "za maxKey");
-        assertTrue(t.get(b("klucz:")).isEmpty(), "przed minKey");
+        assertTrue(t.get(b("key:0200")).isEmpty(), "past maxKey");
+        assertTrue(t.get(b("key:")).isEmpty(), "before minKey");
     }
 
     @Test
     void missingKeyBetweenBlocksIsNotFound(@TempDir Path dir) throws IOException {
         var mt = new MemTable();
-        for (int i = 0; i < 200; i += 2) { // same parzyste
-            mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
+        for (int i = 0; i < 200; i += 2) { // even numbers only
+            mt.put(Record.value(b(String.format("key:%04d", i)), b("v".repeat(120)), i));
         }
         SSTable t = open(track(SSTable.write(dir.resolve("t.sst"), mt.snapshot())).path());
 
-        for (int i = 1; i < 200; i += 2) { // pytamy o nieparzyste
-            String key = String.format("klucz:%04d", i);
-            assertTrue(t.get(b(key)).isEmpty(), key + " nie istnieje");
+        for (int i = 1; i < 200; i += 2) { // ask for the odd ones
+            String key = String.format("key:%04d", i);
+            assertTrue(t.get(b(key)).isEmpty(), key + " does not exist");
         }
     }
 
@@ -376,16 +377,16 @@ class SSTableTest {
     void indexSurvivesCompaction(@TempDir Path dir) throws IOException {
         SSTable older = multiBlockTable(dir.resolve("0.sst"));
         var mt = new MemTable();
-        mt.put(Record.value(b("klucz:0000"), b("nadpisane"), 1000));
+        mt.put(Record.value(b("key:0000"), b("overwritten"), 1000));
         SSTable newer = track(SSTable.write(dir.resolve("1.sst"), mt.snapshot()));
 
         SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
         SSTable reopened = open(merged.path());
 
-        assertTrue(reopened.blockCount() > 1, "scalona tabela tez ma indeks");
+        assertTrue(reopened.blockCount() > 1, "the merged table has an index too");
         assertEquals(200, reopened.entryCount());
-        assertArrayEquals(b("nadpisane"), reopened.get(b("klucz:0000")).orElseThrow().value());
-        assertArrayEquals(b("v".repeat(120)), reopened.get(b("klucz:0199")).orElseThrow().value());
+        assertArrayEquals(b("overwritten"), reopened.get(b("key:0000")).orElseThrow().value());
+        assertArrayEquals(b("v".repeat(120)), reopened.get(b("key:0199")).orElseThrow().value());
     }
 
     @Test
@@ -395,10 +396,10 @@ class SSTableTest {
 
         int survived = 0;
         for (int i = 0; i < 1000; i++) {
-            // Klucze w zakresie minKey..maxKey, wiec zakres ich nie odsieje — robi to filtr.
-            if (t.mightContain(b(String.format("klucz:%04d-x", i)))) survived++;
+            // Keys inside minKey..maxKey, so the range will not reject them — the filter does.
+            if (t.mightContain(b(String.format("key:%04d-x", i)))) survived++;
         }
-        assertTrue(survived < 100, "filtr przepuscil " + survived + "/1000 nieistniejacych kluczy");
+        assertTrue(survived < 100, "the filter let through " + survived + "/1000 nonexistent keys");
     }
 
     @Test
@@ -407,11 +408,11 @@ class SSTableTest {
         writeTable(file, Record.value(b("k"), b("v"), 0));
 
         byte[] raw = Files.readAllBytes(file);
-        raw[SSTable.MAGIC.length] = 1; // plik z M2: dane bez indeksu i filtra
+        raw[SSTable.MAGIC.length] = 1; // an M2 file: data with no index and no filter
         Files.write(file, raw);
 
         IOException e = assertThrows(IOException.class, () -> SSTable.open(file));
-        assertTrue(e.getMessage().contains("wersja"), e.getMessage());
+        assertTrue(e.getMessage().contains("version"), e.getMessage());
     }
 
     @Test
@@ -420,7 +421,7 @@ class SSTableTest {
         SSTable newer = writeTable(dir.resolve("1.sst"), Record.value(b("b"), b("2"), 1));
 
         SSTable merged = compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
-        // Zaden uchwyt do pliku nie przetrwal scalania — inaczej Windows odmowilby kasowania.
+        // delete() closes the channel first — otherwise the merge cursors would still hold the file.
         older.delete();
         newer.delete();
 

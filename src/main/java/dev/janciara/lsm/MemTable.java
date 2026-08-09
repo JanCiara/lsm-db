@@ -6,55 +6,55 @@ import java.util.Optional;
 import java.util.TreeMap;
 
 /**
- * Mutowalna, posortowana warstwa w pamieci — pierwszy przystanek dla kazdego zapisu.
+ * The mutable, sorted in-memory layer — first stop for every write.
  *
- * <p>Trzyma tylko <b>najswiezszy</b> rekord dla danego klucza: kolejny {@code put} na ten sam
- * klucz nadpisuje poprzedni (zwykla wartosc albo tombstone). {@link LsmStore} gwarantuje, ze
- * rekordy przychodza z rosnacym {@code seqNo}, wiec nadpisanie zawsze zachowuje najnowszy stan.
+ * <p>Holds only the <b>freshest</b> record per key: another {@code put} on the same key overwrites
+ * the previous one (a plain value or a tombstone). {@link LsmStore} guarantees records arrive with
+ * increasing {@code seqNo}, so overwriting always keeps the newest state.
  *
- * <p>Klucze sa uporzadkowane <b>unsigned leksykograficznie</b> ({@link Arrays#compareUnsigned}) —
- * to standard w LSM i wymog pod M2 (SSTable zapisuje klucze posortowane). Dzieki temu bajt
- * {@code 0x80} jest wiekszy od {@code 0x7F}, a nie mniejszy (jak przy porownaniu ze znakiem).
+ * <p>Keys are ordered <b>unsigned lexicographically</b> ({@link Arrays#compareUnsigned}) — the LSM
+ * standard, and a hard requirement for SSTables, which store keys sorted. It makes byte
+ * {@code 0x80} greater than {@code 0x7F} rather than smaller, as signed comparison would have it.
  *
- * <p>Warstwa jest „glupia": {@link #get} zwraca caly {@link Record} (moze byc tombstone!).
- * Tlumaczenie tombstone → brak wartosci nalezy do {@link LsmStore}, nie tutaj.
+ * <p>The layer is deliberately "dumb": {@link #get} returns the whole {@link Record}, tombstone
+ * included. Translating a tombstone into "no value" is {@link LsmStore}'s job, not this class's.
  *
- * <p>Nie jest bezpieczna watkowo — M1 zaklada uzycie jednowatkowe.
+ * <p>Not thread-safe — the engine assumes single-threaded use.
  */
 public final class MemTable {
 
     /**
-     * Zryczaltowany narzut na wpis (wezel TreeMap, naglowki obiektow, referencje). Nie chodzi
-     * o dokladny rachunek pamieci, tylko o to, zeby prog zrzutu nie ignorowal miliona pustych
-     * kluczy — sam rozmiar danych bylby wtedy zerowy.
+     * Flat per-entry overhead (TreeMap node, object headers, references). This is not meant to be
+     * an accurate memory accounting, only to stop the flush threshold from ignoring a million empty
+     * keys — their data size alone would be zero.
      */
     private static final long ENTRY_OVERHEAD_BYTES = 64;
 
     private final TreeMap<byte[], Record> entries = new TreeMap<>(Arrays::compareUnsigned);
     private long sizeInBytes;
 
-    /** Wstawia lub nadpisuje wpis dla {@code r.key()}. */
+    /** Inserts or overwrites the entry for {@code r.key()}. */
     public void put(Record r) {
         Record replaced = entries.put(r.key(), r);
         if (replaced != null) sizeInBytes -= weigh(replaced);
         sizeInBytes += weigh(r);
     }
 
-    /** Zwraca przechowywany rekord (moze byc tombstone), albo empty gdy klucza nie ma. */
+    /** Returns the stored record (possibly a tombstone), or empty when the key is absent. */
     public Optional<Record> get(byte[] key) {
         return Optional.ofNullable(entries.get(key));
     }
 
     /**
-     * Rekordy w kolejnosci rosnacych kluczy — dokladnie w postaci, jakiej oczekuje
-     * {@link SSTable#write}. To <b>widok</b> na zywa mape, nie kopia: przeczytaj go do konca
-     * (czyli zapisz tabele) zanim wywolasz {@link #clear()}.
+     * Records in increasing key order — exactly the shape {@link SSTable#write} expects. This is a
+     * <b>view</b> onto the live map, not a copy: consume it fully (that is, write the table) before
+     * calling {@link #clear()}.
      */
     public Collection<Record> snapshot() {
         return entries.values();
     }
 
-    /** Kasuje wszystko — wolane po udanym zrzucie do SSTable. */
+    /** Drops everything — called after a successful flush to an SSTable. */
     public void clear() {
         entries.clear();
         sizeInBytes = 0;
@@ -64,7 +64,7 @@ public final class MemTable {
         return entries.size();
     }
 
-    /** Przyblizone zuzycie pamieci; {@link LsmStore} porownuje je z progiem zrzutu. */
+    /** Approximate memory footprint; {@link LsmStore} compares it against the flush threshold. */
     public long sizeInBytes() {
         return sizeInBytes;
     }

@@ -8,7 +8,7 @@ version = "0.1.0"
 
 java {
     toolchain {
-        // Wymusza JDK 21 niezaleznie od domyslnego javy w systemie.
+        // Pins JDK 21 regardless of the system default java.
         languageVersion = JavaLanguageVersion.of(21)
     }
 }
@@ -31,17 +31,17 @@ tasks.test {
     }
 }
 
-// Benchmarki (M5): ./gradlew jmh — wyniki laduja w build/results/jmh/results.txt
-// Pojedyncza klasa: ./gradlew jmh -PjmhIncludes=WriteBenchmark
+// Benchmarks (M5): ./gradlew jmh — results land in build/results/jmh/results.txt
+// A single class: ./gradlew jmh -PjmhIncludes=WriteBenchmark
 jmh {
     warmupIterations.set(2)
     iterations.set(3)
     fork.set(1)
-    // Krotsze iteracje niz domyslne 10 s — caly przebieg ma miescic sie w kilku minutach.
+    // Shorter iterations than the default 10 s — the whole run should fit in a few minutes.
     warmup.set("1s")
     timeOnIteration.set("2s")
-    // Tryb i jednostke ustala kazdy benchmark u siebie (@BenchmarkMode/@OutputTimeUnit) —
-    // globalne nadpisanie zamienilo by pomiar compaction w cos innego niz deklaruje.
+    // Mode and time unit are set per benchmark (@BenchmarkMode/@OutputTimeUnit) — overriding them
+    // globally would turn the compaction measurement into something other than it claims to be.
     if (project.hasProperty("jmhIncludes")) {
         includes.set(listOf(project.property("jmhIncludes").toString()))
     }

@@ -1,16 +1,16 @@
 # lsm-db
 
-Mini-baza klucz-wartosc na architekturze **LSM-tree**, pisana od zera w Javie 21.
-Bez bibliotek bazodanowych — sens projektu to zaimplementowac silnik samodzielnie.
+A miniature key-value store built on the **LSM-tree** architecture, written from scratch in Java 21.
+No database libraries — the whole point of the project is to implement the engine myself.
 
-> Status: **M5** — kompletny silnik LSM z benchmarkami.
-> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · ~~M4 bloom+index~~ · ~~M5 benchmarki~~.
+> Status: **M5** — complete LSM engine with benchmarks.
+> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · ~~M4 bloom+index~~ · ~~M5 benchmarks~~.
 
 ## Build & test
 ```bash
-./gradlew build      # kompilacja + testy
+./gradlew build      # compile + tests
 ./gradlew test
-./gradlew jmh        # benchmarki -> build/results/jmh/results.txt
+./gradlew jmh        # benchmarks -> build/results/jmh/results.txt
 ```
 
 ## API
@@ -21,186 +21,188 @@ try (KVStore db = LsmStore.open(Path.of("data/"))) {
     db.delete("user:1".getBytes());
 }
 
-// wlasne nastawy
-var opts = LsmStore.Options.defaults()   // 4 MiB memtable, scalanie od 4 tabel, fsync
+// custom settings
+var opts = LsmStore.Options.defaults()   // 4 MiB memtable, compact at 4 tables, fsync
         .withFlushThresholdBytes(64 * 1024)
         .withDurability(Wal.Durability.OS_BUFFERED);
 
 try (LsmStore db = LsmStore.open(Path.of("data/"), opts)) {
     db.put("k".getBytes(), "v".getBytes());
-    db.flush();    // memtable -> nowa SSTable
-    db.compact();  // wszystkie SSTable -> jedna
+    db.flush();    // memtable -> new SSTable
+    db.compact();  // all SSTables -> one
 }
 ```
 
-## Jak to dziala
+## How it works
 
 ```
-put/delete ──► WAL (fsync) ──► memtable (posortowana mapa w pamieci)
-                                   │  prog rozmiaru
+put/delete ──► WAL (fsync) ──► memtable (sorted in-memory map)
+                                   │  size threshold
                                    ▼
-                              SSTable sst-000000.sst   (niemutowalna)
-                                      sst-000001.sst   (nowsza)
-                                      ...                 │ prog liczby tabel
+                              SSTable sst-000000.sst   (immutable)
+                                      sst-000001.sst   (newer)
+                                      ...                 │ table-count threshold
                                                           ▼
-                                              scalenie w sst-000004.sst
+                                              merged into sst-000004.sst
 ```
 
-Odczyt schodzi od najswiezszej warstwy do najstarszej — memtable, potem SSTable od najnowszej —
-i pierwsze trafienie wygrywa. Jesli trafiony rekord to tombstone, klucz jest usuniety, nawet gdy
-starsza tabela ma dla niego wartosc. Po udanym zrzucie WAL jest zerowany; crash pomiedzy zapisem
-tabeli a zerowaniem logu kosztuje tylko powtorzony replay, nigdy utrate danych.
+A read walks from the freshest layer to the oldest — memtable, then SSTables newest-first — and the
+first hit wins. If that hit is a tombstone, the key is deleted, even when an older table still holds
+a value for it. After a successful flush the WAL is cleared; a crash between writing the table and
+clearing the log only costs a repeated replay, never data loss.
 
 ## Compaction
 
-Kazdy zapis tylko dopisuje — nadpisanie zostawia stara wartosc, a `delete` **dodaje** tombstone.
-Bez scalania plikow przybywa w nieskonczonosc, a miejsce po skasowanych kluczach nigdy nie wraca.
-Po przekroczeniu progu liczby tabel silnik scala je wszystkie w jedna (k-way merge po kursorach,
-w pamieci tylko k rekordow), zostawiajac po jednej wersji kazdego klucza i wyrzucajac tombstone'y.
+Every write only appends — an overwrite leaves the old value behind, and `delete` **adds** a
+tombstone. Without merging, files pile up forever and space taken by deleted keys never comes back.
+Once the table count crosses the threshold, the engine merges all of them into one (a k-way merge
+over cursors, holding only k records in memory), keeping a single version of each key and dropping
+tombstones.
 
-Odrzucenie tombstone'a jest bezpieczne **tylko** przy scalaniu obejmujacym najstarsza tabele —
-inaczej odslonilby zakryta pod nim wartosc. Stad jawny parametr `dropTombstones`.
+Dropping a tombstone is safe **only** when the merge includes the oldest table — otherwise it would
+uncover the value it was hiding. Hence the explicit `dropTombstones` parameter.
 
-Podmiana plikow przezywa crash bez MANIFESTu, dzieki dwom regulom:
+The file swap survives a crash without a MANIFEST, thanks to two rules:
 
-1. scalona tabela dostaje **numer wyzszy** niz wejsciowe, wiec przykrywa je od chwili pojawienia
-   sie na dysku — crash przed sprzataniem zostawia martwe pliki, nie zle dane;
-2. zrodla kasujemy **od najstarszego** — kasowanie od gory moglo by zabrac tombstone'a, zostawiajac
-   pod nim starsza wartosc, czyli wskrzesic skasowany klucz (jest na to test).
+1. the merged table gets a **higher number** than its inputs, so it shadows them from the moment it
+   appears on disk — a crash before cleanup leaves dead files, not bad data;
+2. sources are deleted **oldest-first** — deleting top-down could take away a tombstone while leaving
+   an older value of the same key underneath, resurrecting a deleted key (there is a test for this).
 
-## Format rekordu na dysku
+## On-disk record format
 ```
 uvarint(keyLen) | key | byte(tombstone) | uvarint(seqNo) | uvarint(valLen) | value
 ```
-Liczby kodowane jako unsigned LEB128 varint (jak w LevelDB / Protobuf).
+Numbers are encoded as unsigned LEB128 varints (same as LevelDB / Protobuf).
 
-## Format SSTable
+## SSTable format
 ```
-naglowek:    "LSMT" | wersja(1B)
-dane:        record[entryCount]     — klucze scisle rosnace (unsigned), bloki po ~4 KiB
-indeks:      uvarint(blockCount) | { blob(pierwszy klucz bloku) | uvarint(offset) }*
-bloom:       uvarint(bity) | uvarint(k) | uvarint(slowa) | long[]
-stopka:      uvarint(entryCount) | uvarint(maxSeqNo) | blob(minKey) | blob(maxKey)
-             | uvarint(offset indeksu)
-zakonczenie: int32BE(dlugosc stopki) | "LSMT"
+header:  "LSMT" | version(1B)
+data:    record[entryCount]     — strictly increasing keys (unsigned), ~4 KiB blocks
+index:   uvarint(blockCount) | { blob(first key of block) | uvarint(offset) }*
+bloom:   uvarint(bits) | uvarint(k) | uvarint(words) | long[]
+footer:  uvarint(entryCount) | uvarint(maxSeqNo) | blob(minKey) | blob(maxKey)
+         | uvarint(index offset)
+trailer: int32BE(footer length) | "LSMT"
 ```
-Stopka jest na koncu, bo metadane sa znane dopiero po przejsciu wszystkich rekordow; stale
-8 bajtow zakonczenia pozwala ja odnalezc, a powtorzony magic wykrywa uciety plik. Zapis idzie
-przez `.tmp` + fsync + atomowy rename, wiec czytelnik nigdy nie widzi polowicznej tabeli.
+The footer sits at the end because its metadata is only known after streaming through every record;
+the fixed 8-byte trailer is what makes it findable, and the repeated magic catches a truncated file.
+Writing goes through `.tmp` + fsync + atomic rename, so a reader never sees a half-written table.
 
-## Sciezka odczytu punktowego
+## Point-lookup path
 
-Kazda tabela odsiewa pytanie trzema sitami, zanim ruszy dysk z danymi:
+Each table filters the question through three sieves before touching the data on disk:
 
-| sito | koszt | co odrzuca |
+| sieve | cost | what it rejects |
 |---|---|---|
-| zakres `minKey`/`maxKey` ze stopki | 2 porownania | klucze spoza tabeli |
-| filtr Blooma (w pamieci) | 7 operacji na bitach | ~99% chybien w zakresie |
-| indeks blokowy (w pamieci) | wyszukiwanie binarne | wszystkie bloki poza jednym |
+| `minKey`/`maxKey` range from the footer | 2 comparisons | keys outside the table |
+| Bloom filter (in memory) | 7 bit operations | ~99% of in-range misses |
+| block index (in memory) | binary search | every block but one |
 
-Dopiero potem czytany jest **jeden blok** (~4 KiB), a nie caly plik. Indeks i filtr sa male, wiec
-`SSTable.open` wczytuje je raz i trzyma w pamieci. Filtr ma 10 bitow na klucz i `k = 10·ln2 ≈ 7`
-funkcji mieszajacych, liczonych podwojnym haszowaniem (`h_i = h1 + i·h2`, Kirsch-Mitzenmacher) —
-jeden hash FNV-1a zamiast siedmiu niezaleznych. Odpowiedz „nie ma" jest pewna, „moze byc" wymaga
-sprawdzenia w pliku; falszywych negatywow filtr nie produkuje z konstrukcji.
+Only then is **a single block** (~4 KiB) read, rather than the whole file. Index and filter are
+small, so `SSTable.open` loads them once and keeps them in memory. The filter uses 10 bits per key
+and `k = 10·ln2 ≈ 7` hash functions computed by double hashing (`h_i = h1 + i·h2`,
+Kirsch-Mitzenmacher) — one FNV-1a hash instead of seven independent ones. A "not here" answer is
+certain, a "maybe" needs checking in the file; the filter produces no false negatives by
+construction.
 
-Ma to znaczenie glownie dla **chybionych odczytow**: klucz, ktorego nie ma, musialby inaczej
-odwiedzic kazda tabele po kolei.
+This matters most for **missed reads**: a key that does not exist would otherwise have to visit
+every table in turn.
 
-## Trwalosc i zachowanie po crashu
+## Durability and crash behaviour
 
-`Wal.Durability` decyduje, co ma sie stac z rekordem, zanim `put` wroci:
+`Wal.Durability` decides what must happen to a record before `put` returns:
 
-| tryb | co robi | przezywa |
+| mode | what it does | survives |
 |---|---|---|
-| `SYNC` (domyslny) | flush + `fsync` | zanik pradu, crash OS-a |
-| `OS_BUFFERED` | sam flush do cache OS-a | pad procesu, ale nie maszyny |
+| `SYNC` (default) | flush + `fsync` | power loss, OS crash |
+| `OS_BUFFERED` | flush to OS cache only | process death, but not machine death |
 
-Trzy miejsca, w ktorych crash moze zastac silnik, i co sie wtedy dzieje:
+Three points where a crash can catch the engine, and what happens then:
 
-1. **W polowie zapisu do WAL** — log konczy sie niekompletnym rekordem. Replay oddaje wszystkie
-   kompletne rekordy, ucina ogon do ostatniej zdrowej granicy i baza wstaje normalnie. Utracony
-   zapis nigdy nie zostal potwierdzony wywolujacemu, wiec zadna obietnica nie zostala zlamana.
-2. **Miedzy zapisem SSTable a wyczyszczeniem WAL** — replay wraca rekordami, ktore juz sa na dysku.
-   Trafiaja do memtable, czyli do warstwy wygrywajacej. Zaden odczyt nie zobaczy starszej wartosci.
-3. **W trakcie sprzatania po scaleniu** — patrz [Compaction](#compaction): scalona tabela ma wyzszy
-   numer, a zrodla kasowane sa od najstarszego.
+1. **Mid-write to the WAL** — the log ends with an incomplete record. Replay yields every complete
+   record, trims the tail back to the last healthy boundary, and the store opens normally. The lost
+   write was never acknowledged to the caller, so no promise was broken.
+2. **Between writing an SSTable and clearing the WAL** — replay returns records that are already on
+   disk. They land in the memtable, i.e. the winning layer. No read sees an older value because of it.
+3. **During post-merge cleanup** — see [Compaction](#compaction): the merged table has a higher
+   number, and sources are deleted oldest-first.
 
-Czego **nie** wykrywamy: uszkodzenia w srodku pliku, ktore przypadkiem parsuje sie na poprawny
-rekord. Na to potrzebne sa sumy kontrolne (CRC per rekord) — swiadomie poza zakresem. Odsiewane sa
-za to nierealne dlugosci pol, zeby przekrecony bit konczyl sie czytelnym bledem zamiast
-`OutOfMemoryError`.
+What we **don't** catch: corruption in the middle of a file that happens to parse as a valid record.
+That needs checksums (CRC per record) — deliberately out of scope. Implausible field lengths are
+rejected though, so a flipped bit ends in a readable error instead of an `OutOfMemoryError`.
 
-## Benchmarki (M5)
+## Benchmarks (M5)
 
 ```bash
-./gradlew jmh                            # calosc, ~3 min
-./gradlew jmh -PjmhIncludes=ReadBenchmark   # jedna klasa
+./gradlew jmh                               # everything, ~3 min
+./gradlew jmh -PjmhIncludes=ReadBenchmark   # a single class
 ```
 
-Windows 11, JDK 21, laptop. Wartosci bezwzgledne zaleza od sprzetu (szczegolnie koszt `fsync`) —
-znaczenie maja proporcje. Srednia z 3 iteracji po 2 s, 1 fork.
+Windows 11, JDK 21, laptop. Absolute values depend on the hardware (especially the cost of `fsync`) —
+what matters is the ratios. Average of 3 iterations of 2 s each, 1 fork.
 
-**Zapis** (`WriteBenchmark`, wartosc 100 B):
+**Writes** (`WriteBenchmark`, 100 B value):
 
-| operacja | `SYNC` | `OS_BUFFERED` |
+| operation | `SYNC` | `OS_BUFFERED` |
 |---|---|---|
-| `put` sekwencyjny | 393 µs | 5,7 µs |
-| `put` losowy | 429 µs | 7,1 µs |
-| `delete` | 394 µs | 4,2 µs |
+| sequential `put` | 393 µs | 5.7 µs |
+| random `put` | 429 µs | 7.1 µs |
+| `delete` | 394 µs | 4.2 µs |
 
-Przewidywanie z konca M4 sie potwierdzilo: **`fsync` to ~65× caly reszta silnika razem wziety**.
-Wszystko, co robi memtable, WAL i kodowanie rekordu, ginie w cieniu jednego wywolania systemowego.
-Uklad kluczy (sekwencyjne vs losowe) prawie nie ma znaczenia — roznica miesci sie w rozrzucie.
-`delete` kosztuje tyle samo co `put`, bo naprawde jest zapisem.
+The prediction from the end of M4 held: **`fsync` costs ~65× the rest of the engine combined**.
+Everything the memtable, the WAL and record encoding do disappears in the shadow of one system call.
+Key layout (sequential vs random) barely matters — the difference fits inside the noise. `delete`
+costs the same as `put`, because it really is a write.
 
-**Odczyt** (`ReadBenchmark`, 2000 kluczy na tabele):
+**Reads** (`ReadBenchmark`, 2000 keys per table):
 
-| operacja | 1 tabela | 4 tabele | 16 tabel |
+| operation | 1 table | 4 tables | 16 tables |
 |---|---|---|---|
-| trafienie w memtable | 0,30 µs | 0,33 µs | 0,31 µs |
-| trafienie w najnowsza tabele | 5,9 µs | 6,1 µs | 6,0 µs |
-| trafienie w najstarsza tabele | 6,2 µs | 6,0 µs | 5,9 µs |
-| chybienie | 0,33 µs | 0,39 µs | 0,54 µs |
+| hit in memtable | 0.30 µs | 0.33 µs | 0.31 µs |
+| hit in newest table | 5.9 µs | 6.1 µs | 6.0 µs |
+| hit in oldest table | 6.2 µs | 6.0 µs | 5.9 µs |
+| miss | 0.33 µs | 0.39 µs | 0.54 µs |
 
-Dwie rzeczy widac od razu. Po pierwsze, **koszt trafienia nie rosnie z liczba tabel** — filtr Blooma
-odsiewa tabele bez klucza, wiec czytany jest jeden blok niezaleznie od tego, czy tabel jest 1 czy 16.
-Po drugie, **chybienie jest tansze niz trafienie** (~0,5 µs vs ~6 µs) i rosnie o jakies 14 ns na
-kazda dodatkowa tabele — to czysta praca na bitach. Bez filtra chybienie musialoby przeczytac blok
-z kazdej tabeli, czyli przy 16 tabelach byloby rzedu 100 µs zamiast 0,5 µs. To jest wlasnie to,
-za co placilismy w M4.
+Two things stand out. First, **hit cost does not grow with the number of tables** — the Bloom filter
+rejects tables without the key, so a single block is read whether there are 1 or 16 tables. Second,
+**a miss is cheaper than a hit** (~0.5 µs vs ~6 µs) and grows by roughly 14 ns per extra table — that
+is pure bit work. Without the filter a miss would have to read one block from every table, so at 16
+tables it would be on the order of 100 µs instead of 0.5 µs. That is exactly what M4 bought.
 
-**Scalanie** (`CompactionBenchmark`): 15–17 ms dla 2, 4 i 8 tabel po 2000 kluczy. Rozrzut miedzy
-iteracjami jest tu tak duzy (±60–80 ms), ze roznice miedzy wariantami sa nieistotne — z tego pomiaru
-wolno wyciagnac tylko rzad wielkosci, nie krzywa skalowania.
+**Compaction** (`CompactionBenchmark`): 15–17 ms for 2, 4 and 8 tables of 2000 keys. Run-to-run
+spread here is so wide (±60–80 ms) that differences between the variants are meaningless — this
+measurement supports an order of magnitude, not a scaling curve.
 
-### Co benchmark wykryl
+### What the benchmark uncovered
 
-Pierwszy przebieg pokazal **85 µs** na trafienie w SSTable — 250× wolniej niz memtable, czego nie
-tlumaczyl odczyt 4 KiB bloku. Przyczyna: kazdy `get` wolal `Files.newInputStream`, czyli otwieral
-plik od nowa. Samo `open()` bylo ~99% czasu odczytu. Po zamianie na jeden kanal otwarty na cale
-zycie tabeli i odczyty pozycyjne (`channel.read(buffer, position)`, ktore nie ruszaja pozycji
-kanalu, wiec kilka kursorow moze czytac rownolegle) zostalo **6 µs**. Trzynastokrotnie taniej,
-za cene tego, ze `SSTable` jest teraz `Closeable`, a `LsmStore` musi domykac tabele.
+The first run showed **85 µs** for an SSTable hit — 250× slower than the memtable, which reading a
+4 KiB block does not explain. The cause: every `get` called `Files.newInputStream`, reopening the
+file from scratch. The `open()` alone was ~99% of read time. After switching to one channel held
+open for the table's lifetime and positional reads (`channel.read(buffer, position)`, which does not
+move the channel position, so several cursors can read in parallel) it came down to **6 µs**.
+Thirteen times cheaper, at the cost of `SSTable` now being `Closeable` and `LsmStore` having to close
+its tables.
 
-## Znane ograniczenia
+## Known limitations
 
-Rzeczy swiadomie zostawione poza zakresem — nie dlatego, ze sa nieistotne, tylko dlatego, ze
-projekt konczy sie na M5:
+Things deliberately left out of scope — not because they are unimportant, but because the project
+ends at M5:
 
-- **brak sum kontrolnych** — bit-flip w srodku pliku, ktory parsuje sie na poprawny rekord,
-  przejdzie niezauwazony (LevelDB ma CRC32 na blok);
-- **brak wielowatkowosci** — wszystkie klasy zakladaja jeden watek;
-- **zrzut i scalanie blokuja piszacego** — dzieja sie w watku wolajacego `put`, wiec co jakis czas
-  jeden zapis placi za przepisanie calego zbioru; prawdziwe silniki robia to w tle na zamrozonej
-  memtable;
-- **polityka scalania jest naiwna** — prog liczby tabel i scalanie wszystkiego naraz, co daje pelny
-  odzysk miejsca kosztem write amplification (leveled/size-tiered scala tylko podobne rozmiary);
-- **brak skanu zakresowego** — tylko `get`/`put`/`delete`; iterator wymagalby wystawienia k-way
-  merge, ktory juz istnieje wewnatrz `SSTable.compact`;
-- **lista tabel z `ls` katalogu, bez MANIFESTu** — wystarcza, bo podmiana plikow jest odporna na
-  crash sama z siebie (patrz Compaction), ale nie skaluje sie na wiele poziomow.
+- **no checksums** — a bit flip in the middle of a file that still parses as a valid record goes
+  unnoticed (LevelDB has CRC32 per block);
+- **no concurrency** — every class assumes a single thread;
+- **flush and compaction block the writer** — they run on the thread calling `put`, so every so often
+  one write pays for rewriting the entire data set; real engines do this in the background against a
+  frozen memtable;
+- **the compaction policy is naive** — a table-count threshold and merging everything at once, which
+  gives full space reclamation at the cost of write amplification (leveled/size-tiered merges only
+  similar sizes);
+- **no range scan** — only `get`/`put`/`delete`; an iterator would mean exposing the k-way merge that
+  already exists inside `SSTable.compact`;
+- **table list comes from a directory listing, with no MANIFEST** — good enough, because the file
+  swap is crash-safe on its own (see Compaction), but it does not scale to many levels.
 
 ## References
-- DDIA (Kleppmann), rozdz. 3 — Storage and Retrieval
+- DDIA (Kleppmann), ch. 3 — Storage and Retrieval
 - LevelDB / RocksDB — design docs

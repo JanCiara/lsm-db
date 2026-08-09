@@ -17,33 +17,34 @@ import java.nio.file.StandardOpenOption;
 import java.util.function.Consumer;
 
 /**
- * Write-ahead log — append-only plik, do ktorego kazda mutacja trafia <b>zanim</b> zostanie
- * uwidoczniona w {@link MemTable}. Dzieki temu po restarcie/crashu mozna odtworzyc stan pamieci
- * przez {@link #replay(Path, Consumer)}.
+ * Write-ahead log — an append-only file every mutation reaches <b>before</b> it becomes visible in
+ * the {@link MemTable}. That is what makes it possible to rebuild memory state after a restart or
+ * crash via {@link #replay(Path, Consumer)}.
  *
- * <p><b>Trwalosc</b> jest sterowana przez {@link Durability}. Domyslny {@link Durability#SYNC}
- * robi po kazdym rekordzie {@code flush} bufora do OS oraz {@code fsync}
- * ({@link FileDescriptor#sync()}) na dysk — wolne, ale przezywa nawet zanik pradu, czyli caly sens
- * WAL. {@link Durability#OS_BUFFERED} pomija fsync: chroni przed padem procesu, ale nie maszyny.
+ * <p><b>Durability</b> is controlled by {@link Durability}. The default {@link Durability#SYNC}
+ * does a {@code flush} to the OS plus an {@code fsync} ({@link FileDescriptor#sync()}) to disk
+ * after every record — slow, but it survives even a power cut, which is the entire point of a WAL.
+ * {@link Durability#OS_BUFFERED} skips the fsync: it protects against process death, not machine
+ * death.
  *
- * <p><b>Urwany ogon.</b> Crash w polowie {@link #append} zostawia niekompletny rekord na koncu
- * pliku. {@link #replay} traktuje to jako normalny scenariusz: oddaje wszystkie kompletne rekordy,
- * ucina log do ostatniej zdrowej granicy i zwraca jej offset. Zapis, ktory nie zdazyl sie domknac,
- * nigdy nie zostal potwierdzony wywolujacemu, wiec jego utrata nie lamie zadnej obietnicy —
- * natomiast wysypanie sie na starcie zamiast tego lamaloby cala idee logu.
+ * <p><b>Torn tail.</b> A crash halfway through {@link #append} leaves an incomplete record at the
+ * end of the file. {@link #replay} treats this as a normal scenario: it yields every complete
+ * record, trims the log back to the last healthy boundary and returns that offset. A write that
+ * never finished was never acknowledged to the caller, so losing it breaks no promise — whereas
+ * blowing up on startup instead would defeat the whole idea of having a log.
  *
- * <p>Czego to nie wykrywa: uszkodzenia <i>w srodku</i> pliku, ktore przypadkiem parsuje sie na
- * poprawny rekord. Na to potrzebne sa sumy kontrolne — poza zakresem M5.
+ * <p>What this does not catch: corruption <i>inside</i> the file that happens to parse as a valid
+ * record. That needs checksums — out of scope for M5.
  *
- * <p>Nie jest bezpieczny watkowo — silnik zaklada uzycie jednowatkowe.
+ * <p>Not thread-safe — the engine assumes single-threaded use.
  */
 public final class Wal implements AutoCloseable {
 
-    /** Co ma sie stac z rekordem, zanim {@link #append} wroci. */
+    /** What must happen to a record before {@link #append} returns. */
     public enum Durability {
-        /** flush + fsync — rekord jest na talerzu dysku. Przezywa zanik pradu. */
+        /** flush + {@code fsync} — the record is on the platter. Survives power loss. */
         SYNC,
-        /** Sam flush — rekord jest w cache OS-a. Przezywa pad procesu, nie maszyny. */
+        /** flush only — the record is in the OS cache. Survives process death, not machine death. */
         OS_BUFFERED
     }
 
@@ -57,36 +58,36 @@ public final class Wal implements AutoCloseable {
         this.durability = durability;
     }
 
-    /** Otwiera log do dopisywania z domyslna trwaloscia. Nie robi replay. */
+    /** Opens the log for appending with the default durability. Does not replay. */
     public static Wal open(Path file) throws IOException {
         return open(file, Durability.SYNC);
     }
 
-    /** Otwiera log do dopisywania (tworzy plik, jesli nie istnieje). Nie robi replay. */
+    /** Opens the log for appending (creating the file if absent). Does not replay. */
     public static Wal open(Path file, Durability durability) throws IOException {
         Wal wal = new Wal(file, durability);
         wal.openStream(/*append*/ true);
         return wal;
     }
 
-    /** Dopisuje rekord i wymusza go na dysk zgodnie z {@link Durability}. */
+    /** Appends a record and forces it out according to {@link Durability}. */
     public void append(Record r) throws IOException {
         Encoding.writeRecord(out, r);
-        out.flush();                              // bufor -> OS
+        out.flush();                              // buffer -> OS
         if (durability == Durability.SYNC) {
-            fd.sync();                            // OS -> dysk
+            fd.sync();                            // OS -> disk
         }
     }
 
     /**
-     * Odtwarza log: dla kazdego kompletnego rekordu wola {@code sink}, w kolejnosci zapisu.
-     * Brak pliku = no-op (swiezy sklep bez historii).
+     * Replays the log: calls {@code sink} for every complete record, in write order. A missing file
+     * is a no-op (a fresh store with no history).
      *
-     * <p>Jesli plik konczy sie niekompletnym rekordem, metoda <b>ucina go</b> do ostatniej zdrowej
-     * granicy — inaczej kolejne {@code append} dopisywalyby za smieciem i log nie dalby sie juz
-     * nigdy odczytac.
+     * <p>If the file ends with an incomplete record, this method <b>truncates it</b> back to the
+     * last healthy boundary — otherwise subsequent appends would write past the garbage and the log
+     * could never be read again.
      *
-     * @return dlugosc zdrowej czesci logu w bajtach
+     * @return the length of the healthy part of the log, in bytes
      */
     public static long replay(Path file, Consumer<Record> sink) throws IOException {
         if (!Files.exists(file)) return 0;
@@ -100,10 +101,10 @@ public final class Wal implements AutoCloseable {
                 try {
                     r = Encoding.readRecord(in);
                 } catch (EOFException e) {
-                    healthy = recordStart; // rekord urwany w polowie — koniec zdrowej czesci
+                    healthy = recordStart; // record cut in half — end of the healthy part
                     break;
                 }
-                if (r == null) {           // czysty koniec pliku
+                if (r == null) {           // clean end of file
                     healthy = in.count();
                     break;
                 }
@@ -121,17 +122,17 @@ public final class Wal implements AutoCloseable {
     }
 
     /**
-     * Kasuje zawartosc logu i zostawia go otwartym do dalszego dopisywania.
+     * Clears the log's contents and leaves it open for further appends.
      *
-     * <p>Wolane po zrzucie memtable do SSTable: skoro te rekordy leza juz trwale w niemutowalnym
-     * pliku, log przestaje byc potrzebny i moze zaczac rosnac od zera. Kolejnosc jest istotna —
-     * najpierw kompletna SSTable, dopiero potem czyszczenie logu. Crash pomiedzy tymi krokami
-     * kosztuje tylko powtorzony replay tych samych rekordow, nigdy ich utrate.
+     * <p>Called after a memtable flush to an SSTable: once those records sit durably in an immutable
+     * file, the log is no longer needed and can start growing from zero again. The order matters —
+     * a complete SSTable first, only then the log cleanup. A crash between those two steps costs
+     * only a repeated replay of the same records, never their loss.
      */
     public void truncate() throws IOException {
         out.flush();
         out.close();
-        openStream(/*append*/ false); // otwarcie bez append zeruje plik
+        openStream(/*append*/ false); // opening without append zeroes the file
         fd.sync();
     }
 
@@ -147,7 +148,7 @@ public final class Wal implements AutoCloseable {
         this.out = new BufferedOutputStream(fos);
     }
 
-    /** Liczy przeczytane bajty — replay musi wiedziec, gdzie konczy sie ostatni caly rekord. */
+    /** Counts bytes read — replay needs to know where the last whole record ends. */
     private static final class CountingInputStream extends FilterInputStream {
 
         private long count;

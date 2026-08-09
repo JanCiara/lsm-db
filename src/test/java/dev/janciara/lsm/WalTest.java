@@ -45,7 +45,7 @@ class WalTest {
 
     @Test
     void replayMissingFileIsNoOp(@TempDir Path dir) throws IOException {
-        assertTrue(replayAll(dir.resolve("brak.log")).isEmpty());
+        assertTrue(replayAll(dir.resolve("missing.log")).isEmpty());
     }
 
     @Test
@@ -61,7 +61,7 @@ class WalTest {
         try (Wal wal = Wal.open(log)) {
             wal.append(Record.value(b("a"), b("1"), 0));
         }
-        // Ponowne otwarcie do dopisywania nie kasuje historii — nowe rekordy dochodza na koniec.
+        // Reopening for appends does not wipe history — new records land at the end.
         try (Wal wal = Wal.open(log)) {
             wal.append(Record.value(b("b"), b("2"), 1));
         }
@@ -72,7 +72,7 @@ class WalTest {
         assertArrayEquals(b("b"), got.get(1).key());
     }
 
-    /** Ucina plik o {@code bytes} bajtow — tak wyglada crash w polowie zapisu rekordu. */
+    /** Chops {@code bytes} off the file — this is what a crash mid-record looks like. */
     private static void chopTail(Path file, int bytes) throws IOException {
         byte[] full = Files.readAllBytes(file);
         Files.write(file, java.util.Arrays.copyOf(full, full.length - bytes));
@@ -87,13 +87,13 @@ class WalTest {
             wal.append(Record.value(b("c"), b("3"), 2));
         }
         long healthyBefore = Files.size(log);
-        chopTail(log, 3); // ostatni rekord urwany w polowie
+        chopTail(log, 3); // last record cut in half
 
         List<Record> got = replayAll(log);
-        assertEquals(2, got.size(), "kompletne rekordy odzyskane, niedokonczony pominiety");
+        assertEquals(2, got.size(), "complete records recovered, the unfinished one skipped");
         assertArrayEquals(b("a"), got.get(0).key());
         assertArrayEquals(b("b"), got.get(1).key());
-        assertTrue(Files.size(log) < healthyBefore, "urwany ogon zostal odciety z pliku");
+        assertTrue(Files.size(log) < healthyBefore, "the torn tail was trimmed off the file");
     }
 
     @Test
@@ -106,7 +106,7 @@ class WalTest {
         chopTail(log, 2);
 
         assertEquals(1, replayAll(log).size());
-        // Po odcieciu ogona log musi dac sie dopisywac dalej — inaczej baza jest martwa na zawsze.
+        // After trimming, the log must still accept appends — otherwise the store is dead forever.
         try (Wal wal = Wal.open(log)) {
             wal.append(Record.value(b("c"), b("3"), 2));
         }
@@ -125,10 +125,10 @@ class WalTest {
         }
         long complete = Files.size(log);
 
-        assertEquals(complete, Wal.replay(log, r -> { }), "caly plik zdrowy");
+        assertEquals(complete, Wal.replay(log, r -> { }), "the whole file is healthy");
 
         chopTail(log, 1);
-        assertEquals(0, Wal.replay(log, r -> { }), "jedyny rekord byl urwany — zdrowe zero bajtow");
+        assertEquals(0, Wal.replay(log, r -> { }), "the only record was torn — zero healthy bytes");
     }
 
     @Test
@@ -139,7 +139,7 @@ class WalTest {
         }
 
         List<Record> got = replayAll(log);
-        assertEquals(1, got.size(), "bez fsync, ale dane sa juz w OS — pad procesu ich nie zabiera");
+        assertEquals(1, got.size(), "no fsync, but the data is already in the OS — process death spares it");
         assertArrayEquals(b("v"), got.get(0).value());
     }
 
@@ -147,15 +147,15 @@ class WalTest {
     void truncateClearsHistoryButKeepsLogUsable(@TempDir Path dir) throws IOException {
         Path log = dir.resolve("wal.log");
         try (Wal wal = Wal.open(log)) {
-            wal.append(Record.value(b("stary"), b("1"), 0));
-            wal.truncate(); // tak jak po zrzucie memtable do SSTable
+            wal.append(Record.value(b("old"), b("1"), 0));
+            wal.truncate(); // just like after flushing the memtable to an SSTable
             assertEquals(0, Files.size(log));
 
-            wal.append(Record.value(b("nowy"), b("2"), 1));
+            wal.append(Record.value(b("new"), b("2"), 1));
         }
 
         List<Record> got = replayAll(log);
-        assertEquals(1, got.size(), "po truncate zostaja tylko rekordy dopisane pozniej");
-        assertArrayEquals(b("nowy"), got.get(0).key());
+        assertEquals(1, got.size(), "after truncate only records appended later remain");
+        assertArrayEquals(b("new"), got.get(0).key());
     }
 }
