@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Implementacja {@link KVStore} (M2): WAL + memtable + niemutowalne SSTable na dysku.
+ * Implementacja {@link KVStore} (M3): WAL + memtable + niemutowalne SSTable + scalanie tabel.
  *
  * <p><b>Sciezka zapisu.</b> Kazdy {@code put}/{@code delete} najpierw dopisuje rekord do
  * {@link Wal} (trwalosc), a dopiero potem uwidacznia go w {@link MemTable} (widocznosc). Gdy
@@ -29,8 +29,12 @@ import java.util.Optional;
  * jest nieszkodliwy: replay wroci rekordami, ktore juz sa na dysku, a te trafia do memtable —
  * czyli do warstwy wygrywajacej. Zaden odczyt nie zobaczy przez to starszej wartosci.
  *
- * <p>Compaction (scalanie i usuwanie martwych wpisow) to M3 — na razie liczba tabel rosnie,
- * a odczyt chybiony przeglada je wszystkie. Klasa nie jest bezpieczna watkowo.
+ * <p><b>Compaction.</b> Bez scalania liczba tabel roslaby bez konca, a nadpisany albo skasowany
+ * klucz zajmowalby miejsce na zawsze — tombstone to przeciez tez zapis. Po przekroczeniu progu
+ * liczby tabel {@link #compact()} scala wszystkie w jedna, zostawiajac po jednej, najswiezszej
+ * wersji kazdego klucza i wyrzucajac tombstone'y.
+ *
+ * <p>Klasa nie jest bezpieczna watkowo — zaklada uzycie jednowatkowe.
  */
 public final class LsmStore implements KVStore {
 
@@ -41,6 +45,8 @@ public final class LsmStore implements KVStore {
 
     /** Domyslny prog zrzutu memtable na dysk. */
     public static final long DEFAULT_FLUSH_THRESHOLD_BYTES = 4L * 1024 * 1024;
+    /** Domyslna liczba tabel, po ktorej uruchamia sie scalanie. */
+    public static final int DEFAULT_COMPACTION_TRIGGER = 4;
 
     private final Path dir;
     private final MemTable memtable;
@@ -48,32 +54,44 @@ public final class LsmStore implements KVStore {
     /** Od najstarszej do najnowszej — odczyt przeglada te liste od konca. */
     private final List<SSTable> sstables;
     private final long flushThresholdBytes;
+    private final int compactionTrigger;
     private long nextSeqNo;
     private long nextTableNumber;
 
     private LsmStore(Path dir, MemTable memtable, Wal wal, List<SSTable> sstables,
-                     long flushThresholdBytes, long nextSeqNo, long nextTableNumber) {
+                     long flushThresholdBytes, int compactionTrigger,
+                     long nextSeqNo, long nextTableNumber) {
         this.dir = dir;
         this.memtable = memtable;
         this.wal = wal;
         this.sstables = sstables;
         this.flushThresholdBytes = flushThresholdBytes;
+        this.compactionTrigger = compactionTrigger;
         this.nextSeqNo = nextSeqNo;
         this.nextTableNumber = nextTableNumber;
     }
 
-    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnym progiem zrzutu. */
+    /** Otwiera (lub tworzy) sklep w katalogu {@code dir} z domyslnymi progami. */
     public static LsmStore open(Path dir) {
-        return open(dir, DEFAULT_FLUSH_THRESHOLD_BYTES);
+        return open(dir, DEFAULT_FLUSH_THRESHOLD_BYTES, DEFAULT_COMPACTION_TRIGGER);
+    }
+
+    /** Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach). */
+    public static LsmStore open(Path dir, long flushThresholdBytes) {
+        return open(dir, flushThresholdBytes, DEFAULT_COMPACTION_TRIGGER);
     }
 
     /**
-     * Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach). Male wartosci
-     * wymuszaja czeste zrzuty — przydatne w testach i przy zabawie z ksztaltem drzewa.
+     * Jak {@link #open(Path)}, ale z wlasnym progiem zrzutu memtable (w bajtach) i wlasna liczba
+     * tabel wyzwalajaca scalanie. Male wartosci wymuszaja czeste zrzuty i scalania — przydatne
+     * w testach i przy zabawie z ksztaltem drzewa.
      */
-    public static LsmStore open(Path dir, long flushThresholdBytes) {
+    public static LsmStore open(Path dir, long flushThresholdBytes, int compactionTrigger) {
         if (flushThresholdBytes <= 0) {
             throw new IllegalArgumentException("prog zrzutu musi byc dodatni");
+        }
+        if (compactionTrigger < 2) {
+            throw new IllegalArgumentException("scalanie ma sens dopiero od 2 tabel");
         }
         try {
             Files.createDirectories(dir);
@@ -96,7 +114,7 @@ public final class LsmStore implements KVStore {
 
             Wal wal = Wal.open(dir.resolve(WAL_FILE));
             return new LsmStore(dir, memtable, wal, sstables, flushThresholdBytes,
-                    seqNo[0] + 1, maxTableNumber + 1);
+                    compactionTrigger, seqNo[0] + 1, maxTableNumber + 1);
         } catch (IOException e) {
             throw new UncheckedIOException("nie udalo sie otworzyc sklepu w " + dir, e);
         }
@@ -131,13 +149,48 @@ public final class LsmStore implements KVStore {
     public void flush() {
         if (memtable.isEmpty()) return;
         try {
-            Path file = dir.resolve(String.format("%s%06d%s", SST_PREFIX, nextTableNumber, SST_SUFFIX));
-            sstables.add(SSTable.write(file, memtable.snapshot()));
-            nextTableNumber++;
+            sstables.add(SSTable.write(nextTablePath(), memtable.snapshot()));
             memtable.clear();
             wal.truncate();
         } catch (IOException e) {
             throw new UncheckedIOException("zrzut memtable do SSTable nie powiodl sie", e);
+        }
+        if (sstables.size() >= compactionTrigger) compact();
+    }
+
+    /**
+     * Scala wszystkie SSTable w jedna: kazdy klucz zostaje w najswiezszej wersji, a tombstone'y
+     * znikaja calkiem. Dopiero to odzyskuje miejsce po nadpisaniach i usunieciach — do tego momentu
+     * kazdy zapis, takze {@code delete}, tylko powieksza zbior plikow. No-op ponizej dwoch tabel.
+     *
+     * <p><b>Odpornosc na crash</b> opiera sie na dwoch rzeczach i warto rozumiec obie:
+     *
+     * <p>1. Scalona tabela dostaje <b>numer wyzszy</b> niz wszystkie wejsciowe, wiec od momentu
+     * pojawienia sie na dysku przykrywa je w odczycie. Crash po jej zapisaniu, a przed skasowaniem
+     * zrodel, zostawia tylko martwe pliki — nigdy zlych danych.
+     *
+     * <p>2. Zrodla kasujemy <b>od najstarszego</b>. To nie jest kosmetyka: gdyby posypac sie
+     * odwrotnie, crash moglby zabrac tombstone'a, zostawiajac pod nim starsza wartosc tego samego
+     * klucza — i skasowany klucz wracalby z martwych. Kasowanie od dolu gwarantuje, ze zbior
+     * ocalalych tabel to zawsze <i>koncowy</i> fragment historii, w ktorym najswiezszy rekord
+     * kazdego klucza wciaz jest obecny.
+     */
+    public void compact() {
+        if (sstables.size() < 2) return;
+        try {
+            List<SSTable> inputs = List.copyOf(sstables);
+            // Scalamy komplet tabel, wiec pod spodem nie zostaje nic, co tombstone mialby przykrywac.
+            Optional<SSTable> merged = SSTable.compact(nextTablePath(), inputs, /*dropTombstones*/ true);
+
+            for (SSTable stale : inputs) { // kolejnosc listy = od najstarszej
+                stale.delete();
+            }
+            SSTable.syncDir(dir);
+
+            sstables.clear();
+            merged.ifPresent(sstables::add);
+        } catch (IOException e) {
+            throw new UncheckedIOException("scalanie SSTable nie powiodlo sie", e);
         }
     }
 
@@ -166,6 +219,11 @@ public final class LsmStore implements KVStore {
         }
         memtable.put(r);
         if (memtable.sizeInBytes() >= flushThresholdBytes) flush();
+    }
+
+    /** Sciezka kolejnej tabeli; numer rosnie z kazdym zrzutem i scaleniem. */
+    private Path nextTablePath() {
+        return dir.resolve(String.format("%s%06d%s", SST_PREFIX, nextTableNumber++, SST_SUFFIX));
     }
 
     /** Przeglada tabele od najnowszej — pierwsze trafienie jest z definicji najswiezsze. */

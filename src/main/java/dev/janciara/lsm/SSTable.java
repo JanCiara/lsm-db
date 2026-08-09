@@ -4,6 +4,7 @@ import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
+import java.io.Closeable;
 import java.io.EOFException;
 import java.io.FileOutputStream;
 import java.io.IOException;
@@ -19,12 +20,15 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
+import java.util.PriorityQueue;
 
 /**
  * Sorted String Table — <b>niemutowalny</b> plik z rekordami posortowanymi rosnaco po kluczu.
- * Powstaje przez zrzut ({@code flush}) memtable i od tego momentu jest tylko czytany.
+ * Powstaje przez zrzut ({@code flush}) memtable albo przez scalenie kilku starszych tabel
+ * ({@link #compact}) i od tego momentu jest tylko czytany.
  *
  * <p>Uklad pliku:
  * <pre>
@@ -40,9 +44,13 @@ import java.util.Optional;
  * i dopiero potem sama stopke. Powtorzony magic na koncu jest tania kontrola, ze plik nie zostal
  * uciety w polowie zapisu.
  *
- * <p><b>Zapis jest atomowy:</b> {@link #write} tworzy plik {@code .tmp}, fsync-uje go i dopiero
+ * <p><b>Zapis jest atomowy:</b> {@link Writer} tworzy plik {@code .tmp}, fsync-uje go i dopiero
  * wtedy podmienia nazwe ({@code ATOMIC_MOVE}). Czytelnik nigdy nie zobaczy polowicznej tabeli —
  * albo pliku nie ma, albo jest kompletny.
+ *
+ * <p><b>Zaden uchwyt do pliku nie zyje dluzej niz pojedyncza operacja</b> — {@link #get} i
+ * {@link Cursor} otwieraja strumien i zamykaja go po sobie. Dzieki temu scalona tabela moze
+ * skasowac swoje zrodla nawet na Windows, ktory nie pozwala usunac otwartego pliku.
  *
  * <p><b>Wyszukiwanie w M2 jest liniowe</b> — skan od poczatku danych. Dwie tanie optymalizacje juz
  * dzialaja: {@code minKey}/{@code maxKey} ze stopki odsiewaja caly plik, a posortowanie kluczy
@@ -82,42 +90,106 @@ public final class SSTable {
      */
     public static SSTable write(Path file, Collection<Record> sorted) throws IOException {
         if (sorted.isEmpty()) throw new IllegalArgumentException("pusta SSTable nie ma sensu");
-
-        Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-        long count = 0;
-        long maxSeq = 0;
-        byte[] minKey = null;
-        byte[] prevKey = null;
-
-        try (FileOutputStream fos = new FileOutputStream(tmp.toFile())) {
-            OutputStream out = new BufferedOutputStream(fos);
-            out.write(MAGIC);
-            out.write(VERSION);
-
+        try (Writer writer = writer(file)) {
             for (Record r : sorted) {
-                if (prevKey != null && Arrays.compareUnsigned(prevKey, r.key()) >= 0) {
-                    throw new IllegalArgumentException(
-                            "rekordy musza byc posortowane rosnaco i bez duplikatow kluczy");
-                }
-                if (minKey == null) minKey = r.key();
-                prevKey = r.key();
-                Encoding.writeRecord(out, r);
-                count++;
-                if (r.seqNo() > maxSeq) maxSeq = r.seqNo();
+                writer.add(r);
+            }
+            return writer.finish().orElseThrow();
+        }
+    }
+
+    /** Otwiera writer do strumieniowego budowania tabeli — uzywany przy zrzucie i przy scalaniu. */
+    public static Writer writer(Path file) throws IOException {
+        return new Writer(file);
+    }
+
+    /**
+     * Buduje tabele rekord po rekordzie, bez trzymania calosci w pamieci.
+     *
+     * <p>Cykl zycia: {@link #add} n razy, potem {@link #finish}. Writer zamkniety bez
+     * {@code finish} (wyjatek w srodku scalania) sprzata po sobie plik {@code .tmp} — dlatego
+     * uzywaj go w {@code try-with-resources}.
+     */
+    public static final class Writer implements Closeable {
+
+        private final Path file;
+        private final Path tmp;
+        private final FileOutputStream fos;
+        private final OutputStream out;
+
+        private long entryCount;
+        private long maxSeqNo;
+        private byte[] minKey;
+        private byte[] prevKey;
+        private boolean closed;
+
+        private Writer(Path file) throws IOException {
+            this.file = file;
+            this.tmp = file.resolveSibling(file.getFileName() + ".tmp");
+            this.fos = new FileOutputStream(tmp.toFile());
+            try {
+                this.out = new BufferedOutputStream(fos);
+                out.write(MAGIC);
+                out.write(VERSION);
+            } catch (IOException e) {
+                fos.close();
+                Files.deleteIfExists(tmp);
+                throw e;
+            }
+        }
+
+        /** Dopisuje rekord; klucze musza isc scisle rosnaco (unsigned). */
+        public void add(Record r) throws IOException {
+            if (closed) throw new IllegalStateException("writer juz zamkniety");
+            if (prevKey != null && Arrays.compareUnsigned(prevKey, r.key()) >= 0) {
+                throw new IllegalArgumentException(
+                        "rekordy musza byc posortowane rosnaco i bez duplikatow kluczy");
+            }
+            if (minKey == null) minKey = r.key();
+            prevKey = r.key();
+            Encoding.writeRecord(out, r);
+            entryCount++;
+            if (r.seqNo() > maxSeqNo) maxSeqNo = r.seqNo();
+        }
+
+        /**
+         * Domyka plik: stopka, fsync, atomowa podmiana nazwy.
+         *
+         * @return pusty Optional gdy nie dodano ani jednego rekordu — wtedy zaden plik nie powstaje.
+         *         Tak konczy sie scalanie, w ktorym wszystko okazalo sie tombstone'ami.
+         */
+        public Optional<SSTable> finish() throws IOException {
+            if (closed) throw new IllegalStateException("writer juz zamkniety");
+            closed = true;
+
+            if (entryCount == 0) {
+                out.close();
+                Files.deleteIfExists(tmp);
+                return Optional.empty();
             }
 
-            byte[] footer = buildFooter(count, maxSeq, minKey, prevKey);
+            byte[] footer = buildFooter(entryCount, maxSeqNo, minKey, prevKey);
             out.write(footer);
             out.write(intBE(footer.length));
             out.write(MAGIC);
 
-            out.flush();       // bufor -> OS
+            out.flush();        // bufor -> OS
             fos.getFD().sync(); // OS -> dysk; dopiero teraz podmiana nazwy cos gwarantuje
+            out.close();
+
+            Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE);
+            syncDir(file.getParent());
+            return Optional.of(new SSTable(file, entryCount, maxSeqNo, minKey, prevKey));
         }
 
-        Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE);
-        syncDir(file.getParent());
-        return new SSTable(file, count, maxSeq, minKey, prevKey);
+        /** Po {@link #finish} nic nie robi; w przeciwnym razie kasuje niedokonczony plik tymczasowy. */
+        @Override
+        public void close() throws IOException {
+            if (closed) return;
+            closed = true;
+            out.close();
+            Files.deleteIfExists(tmp);
+        }
     }
 
     private static byte[] buildFooter(long entryCount, long maxSeqNo, byte[] minKey, byte[] maxKey) {
@@ -131,6 +203,83 @@ public final class SSTable {
             throw new UncheckedIOException(e); // ByteArrayOutputStream nie rzuca realnie
         }
         return bos.toByteArray();
+    }
+
+    // ---- scalanie (M3) -------------------------------------------------------
+
+    /**
+     * Scala kilka tabel w jedna, zostawiajac dla kazdego klucza tylko najswiezsza wersje.
+     *
+     * <p>Klasyczny k-way merge: kolejka priorytetowa trzyma po jednym kursorze na tabele,
+     * uporzadkowanym po biezacym kluczu rosnaco, a przy remisie — po swiezosci tabeli malejaco.
+     * Dzieki temu pierwszy wyjety rekord danego klucza jest zwyciezca, a wszystkie kolejne z tym
+     * samym kluczem to przestarzale wersje do wyrzucenia. Pamiec zajmuje tylko k rekordow, nie
+     * caly zbior — dlatego scalanie idzie przez {@link Cursor} i {@link Writer}, a nie przez listy.
+     *
+     * @param inputs        tabele od <b>najstarszej do najnowszej</b> — ta kolejnosc rozstrzyga remisy
+     * @param dropTombstones czy wyrzucac tombstone'y zamiast je przepisywac. Wolno to zrobic
+     *        <b>wylacznie</b> gdy {@code inputs} obejmuje takze najstarsza tabele w sklepie: tombstone
+     *        istnieje po to, zeby przykrywac starsza wartosc, wiec usuniety zbyt wczesnie wskrzesza
+     *        skasowany klucz. Przy scalaniu wszystkiego pod spodem nie zostaje juz nic do przykrycia.
+     * @return nowa tabela, albo pusty Optional gdy po scaleniu nie zostal ani jeden rekord
+     */
+    public static Optional<SSTable> compact(Path target, List<SSTable> inputs, boolean dropTombstones)
+            throws IOException {
+        var cursors = new ArrayList<Cursor>(inputs.size());
+        try (Writer writer = writer(target)) {
+            var queue = new PriorityQueue<Source>(Math.max(1, inputs.size()), Source.BY_KEY_THEN_RECENCY);
+            for (int rank = 0; rank < inputs.size(); rank++) {
+                Cursor cursor = inputs.get(rank).cursor();
+                cursors.add(cursor);
+                if (cursor.peek() != null) queue.add(new Source(cursor, rank));
+            }
+
+            while (!queue.isEmpty()) {
+                Source winner = queue.poll();
+                Record newest = winner.cursor.peek();
+                step(winner, queue);
+
+                // Ten sam klucz w starszych tabelach — przewijamy, nie zapisujemy.
+                while (!queue.isEmpty()
+                        && Arrays.compareUnsigned(queue.peek().cursor.peek().key(), newest.key()) == 0) {
+                    step(queue.poll(), queue);
+                }
+
+                if (newest.tombstone() && dropTombstones) continue;
+                writer.add(newest);
+            }
+            return writer.finish();
+        } finally {
+            for (Cursor c : cursors) {
+                try {
+                    c.close();
+                } catch (IOException ignored) {
+                    // strumienie tylko do odczytu — blad zamkniecia nie zmienia wyniku scalania
+                }
+            }
+        }
+    }
+
+    /** Przesuwa kursor i wklada go z powrotem do kolejki, o ile cos jeszcze zostalo. */
+    private static void step(Source source, PriorityQueue<Source> queue) throws IOException {
+        source.cursor.advance();
+        if (source.cursor.peek() != null) queue.add(source);
+    }
+
+    /** Kursor + jego pozycja w porzadku swiezosci ({@code rank} rosnie z wiekiem tabeli w dol). */
+    private static final class Source {
+
+        static final Comparator<Source> BY_KEY_THEN_RECENCY =
+                Comparator.<Source, byte[]>comparing(s -> s.cursor.peek().key(), Arrays::compareUnsigned)
+                        .thenComparing(s -> s.rank, Comparator.reverseOrder());
+
+        final Cursor cursor;
+        final int rank;
+
+        Source(Cursor cursor, int rank) {
+            this.cursor = cursor;
+            this.rank = rank;
+        }
     }
 
     // ---- odczyt --------------------------------------------------------------
@@ -177,12 +326,13 @@ public final class SSTable {
      */
     public Optional<Record> get(byte[] key) throws IOException {
         if (!mightContain(key)) return Optional.empty();
-        try (InputStream in = dataStream()) {
-            for (long i = 0; i < entryCount; i++) {
-                Record r = readOrFail(in, i);
+        try (Cursor cursor = cursor()) {
+            Record r;
+            while ((r = cursor.peek()) != null) {
                 int cmp = Arrays.compareUnsigned(r.key(), key);
                 if (cmp == 0) return Optional.of(r);
                 if (cmp > 0) return Optional.empty(); // klucze rosna — dalej juz go nie bedzie
+                cursor.advance();
             }
         }
         return Optional.empty();
@@ -193,15 +343,74 @@ public final class SSTable {
         return Arrays.compareUnsigned(key, minKey) >= 0 && Arrays.compareUnsigned(key, maxKey) <= 0;
     }
 
-    /** Wszystkie rekordy w kolejnosci rosnacych kluczy — pod compaction (M3) i testy. */
+    /** Wszystkie rekordy w kolejnosci rosnacych kluczy — wygodne w testach, kosztowne w pamieci. */
     public List<Record> readAll() throws IOException {
-        var out = new ArrayList<Record>(Math.toIntExact(entryCount));
-        try (InputStream in = dataStream()) {
-            for (long i = 0; i < entryCount; i++) {
-                out.add(readOrFail(in, i));
+        var all = new ArrayList<Record>(Math.toIntExact(entryCount));
+        try (Cursor cursor = cursor()) {
+            Record r;
+            while ((r = cursor.peek()) != null) {
+                all.add(r);
+                cursor.advance();
             }
         }
-        return out;
+        return all;
+    }
+
+    /** Kursor ustawiony na pierwszym rekordzie. Wywolujacy go zamyka. */
+    public Cursor cursor() throws IOException {
+        InputStream in = dataStream();
+        try {
+            Cursor cursor = new Cursor(in);
+            cursor.advance();
+            return cursor;
+        } catch (IOException e) {
+            in.close();
+            throw e;
+        }
+    }
+
+    /**
+     * Jednokierunkowy przesuw po rekordach tabeli. Rozdzielenie {@link #peek} od {@link #advance}
+     * jest po to, ze scalanie musi <i>porownac</i> biezace klucze wszystkich zrodel, zanim
+     * zdecyduje, ktore z nich przesunac.
+     */
+    public final class Cursor implements Closeable {
+
+        private final InputStream in;
+        private long remaining = entryCount;
+        private Record current;
+
+        private Cursor(InputStream in) {
+            this.in = in;
+        }
+
+        /** Biezacy rekord albo {@code null}, gdy tabela sie skonczyla. Nie dotyka dysku. */
+        public Record peek() {
+            return current;
+        }
+
+        public void advance() throws IOException {
+            if (remaining == 0) {
+                current = null;
+                return;
+            }
+            current = Encoding.readRecord(in);
+            if (current == null) {
+                throw new EOFException("SSTable " + file + " obiecuje " + entryCount
+                        + " rekordow, a skonczyla sie " + remaining + " przed koncem");
+            }
+            remaining--;
+        }
+
+        @Override
+        public void close() throws IOException {
+            in.close();
+        }
+    }
+
+    /** Kasuje plik tabeli. Uwaga na kolejnosc — patrz {@code LsmStore#compact}. */
+    public void delete() throws IOException {
+        Files.delete(file);
     }
 
     public Path path() {
@@ -244,20 +453,6 @@ public final class SSTable {
         return in;
     }
 
-    /**
-     * Czyta rekord nr {@code index}. Stopka mowi ile ich jest, wiec czytamy dokladnie tyle i nie
-     * musimy odrozniac konca danych od poczatku stopki — a niezgodnosc licznika z trescia od razu
-     * wychodzi jako blad zamiast smieciowego rekordu.
-     */
-    private Record readOrFail(InputStream in, long index) throws IOException {
-        Record r = Encoding.readRecord(in);
-        if (r == null) {
-            throw new EOFException("SSTable " + file + " obiecuje " + entryCount
-                    + " rekordow, a skonczyla sie na " + index);
-        }
-        return r;
-    }
-
     private static byte[] readAt(FileChannel ch, long position, int length) throws IOException {
         ByteBuffer buf = ByteBuffer.allocate(length);
         while (buf.hasRemaining()) {
@@ -273,10 +468,10 @@ public final class SSTable {
     }
 
     /**
-     * fsync katalogu, zeby sama podmiana nazwy przetrwala crash OS-a. Windows nie pozwala otworzyc
-     * katalogu jako pliku — tam po prostu odpuszczamy (i tak polegamy na tym, ze rename jest atomowy).
+     * fsync katalogu, zeby podmiana nazwy albo skasowanie pliku przetrwalo crash OS-a. Windows nie
+     * pozwala otworzyc katalogu jako pliku — tam odpuszczamy (i tak polegamy na atomowosci rename).
      */
-    private static void syncDir(Path dir) {
+    static void syncDir(Path dir) {
         if (dir == null) return;
         try (FileChannel ch = FileChannel.open(dir, StandardOpenOption.READ)) {
             ch.force(true);

@@ -3,8 +3,8 @@
 Mini-baza klucz-wartosc na architekturze **LSM-tree**, pisana od zera w Javie 21.
 Bez bibliotek bazodanowych — sens projektu to zaimplementowac silnik samodzielnie.
 
-> Status: **M2** — WAL + memtable + zrzut do niemutowalnych SSTable na dysku.
-> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · M3 compaction · M4 bloom+index · M5 benchmarki.
+> Status: **M3** — WAL + memtable + SSTable + scalanie tabel (odzysk miejsca).
+> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · M4 bloom+index · M5 benchmarki.
 
 ## Build & test
 ```bash
@@ -20,10 +20,11 @@ try (KVStore db = LsmStore.open(Path.of("data/"))) {
     db.delete("user:1".getBytes());
 }
 
-// wlasny prog zrzutu memtable (domyslnie 4 MiB) + reczny zrzut
-try (LsmStore db = LsmStore.open(Path.of("data/"), 64 * 1024)) {
+// wlasny prog zrzutu memtable (domyslnie 4 MiB) i liczba tabel wyzwalajaca scalanie (domyslnie 4)
+try (LsmStore db = LsmStore.open(Path.of("data/"), 64 * 1024, 4)) {
     db.put("k".getBytes(), "v".getBytes());
-    db.flush();
+    db.flush();    // memtable -> nowa SSTable
+    db.compact();  // wszystkie SSTable -> jedna
 }
 ```
 
@@ -35,12 +36,32 @@ put/delete ──► WAL (fsync) ──► memtable (posortowana mapa w pamieci)
                                    ▼
                               SSTable sst-000000.sst   (niemutowalna)
                                       sst-000001.sst   (nowsza)
+                                      ...                 │ prog liczby tabel
+                                                          ▼
+                                              scalenie w sst-000004.sst
 ```
 
 Odczyt schodzi od najswiezszej warstwy do najstarszej — memtable, potem SSTable od najnowszej —
 i pierwsze trafienie wygrywa. Jesli trafiony rekord to tombstone, klucz jest usuniety, nawet gdy
 starsza tabela ma dla niego wartosc. Po udanym zrzucie WAL jest zerowany; crash pomiedzy zapisem
 tabeli a zerowaniem logu kosztuje tylko powtorzony replay, nigdy utrate danych.
+
+## Compaction
+
+Kazdy zapis tylko dopisuje — nadpisanie zostawia stara wartosc, a `delete` **dodaje** tombstone.
+Bez scalania plikow przybywa w nieskonczonosc, a miejsce po skasowanych kluczach nigdy nie wraca.
+Po przekroczeniu progu liczby tabel silnik scala je wszystkie w jedna (k-way merge po kursorach,
+w pamieci tylko k rekordow), zostawiajac po jednej wersji kazdego klucza i wyrzucajac tombstone'y.
+
+Odrzucenie tombstone'a jest bezpieczne **tylko** przy scalaniu obejmujacym najstarsza tabele —
+inaczej odslonilby zakryta pod nim wartosc. Stad jawny parametr `dropTombstones`.
+
+Podmiana plikow przezywa crash bez MANIFESTu, dzieki dwom regulom:
+
+1. scalona tabela dostaje **numer wyzszy** niz wejsciowe, wiec przykrywa je od chwili pojawienia
+   sie na dysku — crash przed sprzataniem zostawia martwe pliki, nie zle dane;
+2. zrodla kasujemy **od najstarszego** — kasowanie od gory moglo by zabrac tombstone'a, zostawiajac
+   pod nim starsza wartosc, czyli wskrzesic skasowany klucz (jest na to test).
 
 ## Format rekordu na dysku
 ```

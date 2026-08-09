@@ -3,6 +3,7 @@ package dev.janciara.lsm;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -184,5 +185,125 @@ class SSTableTest {
         Files.write(file, new byte[] {'L', 'S', 'M', 'T'});
 
         assertThrows(IOException.class, () -> SSTable.open(file));
+    }
+
+    @Test
+    void cursorWalksRecordsInKeyOrderAndStops(@TempDir Path dir) throws IOException {
+        SSTable t = writeTable(dir.resolve("t.sst"),
+                Record.value(b("b"), b("2"), 1),
+                Record.value(b("a"), b("1"), 0));
+
+        try (SSTable.Cursor cursor = t.cursor()) {
+            assertArrayEquals(b("a"), cursor.peek().key());
+            assertArrayEquals(b("a"), cursor.peek().key(), "peek nie przesuwa kursora");
+            cursor.advance();
+            assertArrayEquals(b("b"), cursor.peek().key());
+            cursor.advance();
+            assertNull(cursor.peek(), "null oznacza koniec tabeli");
+        }
+    }
+
+    @Test
+    void abandonedWriterLeavesNoTempFile(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("t.sst");
+        try (SSTable.Writer writer = SSTable.writer(file)) {
+            writer.add(Record.value(b("a"), b("1"), 0));
+            // brak finish() — symuluje wyjatek w polowie scalania
+        }
+
+        assertFalse(Files.exists(file), "docelowy plik nie powstaje");
+        assertFalse(Files.exists(dir.resolve("t.sst.tmp")), "smiec po sobie posprzatany");
+    }
+
+    // ---- M3: scalanie ------------------------------------------------------
+
+    @Test
+    void compactKeepsNewestVersionOfEachKey(@TempDir Path dir) throws IOException {
+        SSTable older = writeTable(dir.resolve("0.sst"),
+                Record.value(b("a"), b("stare-a"), 0),
+                Record.value(b("b"), b("stare-b"), 1));
+        SSTable newer = writeTable(dir.resolve("1.sst"),
+                Record.value(b("b"), b("nowe-b"), 2),
+                Record.value(b("c"), b("nowe-c"), 3));
+
+        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+
+        List<Record> all = merged.readAll();
+        assertEquals(3, all.size(), "wspolny klucz zostaje raz");
+        assertArrayEquals(b("stare-a"), all.get(0).value());
+        assertArrayEquals(b("nowe-b"), all.get(1).value(), "wygrywa wersja z nowszej tabeli");
+        assertArrayEquals(b("nowe-c"), all.get(2).value());
+        assertEquals(3, merged.maxSeqNo());
+    }
+
+    @Test
+    void compactInterleavesKeysFromManyTables(@TempDir Path dir) throws IOException {
+        SSTable t0 = writeTable(dir.resolve("0.sst"), Record.value(b("a"), b("1"), 0),
+                Record.value(b("d"), b("4"), 1));
+        SSTable t1 = writeTable(dir.resolve("1.sst"), Record.value(b("b"), b("2"), 2));
+        SSTable t2 = writeTable(dir.resolve("2.sst"), Record.value(b("c"), b("3"), 3),
+                Record.value(b("e"), b("5"), 4));
+
+        SSTable merged = SSTable.compact(dir.resolve("3.sst"), List.of(t0, t1, t2), true).orElseThrow();
+
+        List<byte[]> keys = merged.readAll().stream().map(Record::key).toList();
+        assertEquals(5, keys.size());
+        assertArrayEquals(b("a"), keys.get(0));
+        assertArrayEquals(b("b"), keys.get(1));
+        assertArrayEquals(b("c"), keys.get(2));
+        assertArrayEquals(b("d"), keys.get(3));
+        assertArrayEquals(b("e"), keys.get(4));
+    }
+
+    @Test
+    void compactDropsTombstonesWhenMergingEverything(@TempDir Path dir) throws IOException {
+        SSTable older = writeTable(dir.resolve("0.sst"),
+                Record.value(b("zyje"), b("v"), 0),
+                Record.value(b("znika"), b("v"), 1));
+        SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("znika"), 2));
+
+        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+
+        List<Record> all = merged.readAll();
+        assertEquals(1, all.size(), "i wartosc, i przykrywajacy ja tombstone znikaja");
+        assertArrayEquals(b("zyje"), all.get(0).key());
+    }
+
+    @Test
+    void compactKeepsTombstonesWhenOlderTablesRemain(@TempDir Path dir) throws IOException {
+        SSTable older = writeTable(dir.resolve("0.sst"), Record.value(b("k"), b("v"), 0));
+        SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("k"), 1));
+
+        // dropTombstones=false: pod spodem moze lezec starsza tabela, ktorej tombstone wciaz pilnuje
+        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), false).orElseThrow();
+
+        List<Record> all = merged.readAll();
+        assertEquals(1, all.size());
+        assertTrue(all.get(0).tombstone(), "tombstone przepisany, nie wyrzucony");
+    }
+
+    @Test
+    void compactProducesNoFileWhenEverythingWasDeleted(@TempDir Path dir) throws IOException {
+        SSTable older = writeTable(dir.resolve("0.sst"), Record.value(b("k"), b("v"), 0));
+        SSTable newer = writeTable(dir.resolve("1.sst"), Record.tombstone(b("k"), 1));
+
+        Path target = dir.resolve("2.sst");
+        assertTrue(SSTable.compact(target, List.of(older, newer), true).isEmpty());
+        assertFalse(Files.exists(target), "pusta tabela nie zostawia pliku");
+        assertFalse(Files.exists(dir.resolve("2.sst.tmp")));
+    }
+
+    @Test
+    void compactedTableCanDeleteItsSources(@TempDir Path dir) throws IOException {
+        SSTable older = writeTable(dir.resolve("0.sst"), Record.value(b("a"), b("1"), 0));
+        SSTable newer = writeTable(dir.resolve("1.sst"), Record.value(b("b"), b("2"), 1));
+
+        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        // Zaden uchwyt do pliku nie przetrwal scalania — inaczej Windows odmowilby kasowania.
+        older.delete();
+        newer.delete();
+
+        assertFalse(Files.exists(dir.resolve("0.sst")));
+        assertArrayEquals(b("2"), merged.get(b("b")).orElseThrow().value());
     }
 }
