@@ -52,8 +52,9 @@ class SSTableTest {
         assertTrue(t.get(b("c")).isEmpty(), "dziura w srodku zakresu");
         assertTrue(t.get(b("a")).isEmpty(), "przed minKey");
         assertTrue(t.get(b("z")).isEmpty(), "za maxKey");
-        assertFalse(t.mightContain(b("z")));
-        assertTrue(t.mightContain(b("c")), "zakres nie wyklucza dziur — to tylko zgrubny odsiew");
+        assertFalse(t.mightContain(b("z")), "odsiew po zakresie kluczy");
+        assertFalse(t.mightContain(b("c")), "dziure w srodku zakresu lapie dopiero filtr Blooma");
+        assertTrue(t.mightContain(b("b")), "istniejacy klucz nigdy nie jest odsiany");
     }
 
     @Test
@@ -291,6 +292,95 @@ class SSTableTest {
         assertTrue(SSTable.compact(target, List.of(older, newer), true).isEmpty());
         assertFalse(Files.exists(target), "pusta tabela nie zostawia pliku");
         assertFalse(Files.exists(dir.resolve("2.sst.tmp")));
+    }
+
+    // ---- M4: indeks blokowy i filtr Blooma ---------------------------------
+
+    /** Tabela wyraznie wieksza niz jeden blok: 200 rekordow po ~120 B to ~24 KiB. */
+    private static SSTable multiBlockTable(Path file) throws IOException {
+        var mt = new MemTable();
+        for (int i = 0; i < 200; i++) {
+            mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
+        }
+        return SSTable.write(file, mt.snapshot());
+    }
+
+    @Test
+    void largeTableIsSplitIntoSeveralBlocks(@TempDir Path dir) throws IOException {
+        SSTable t = multiBlockTable(dir.resolve("t.sst"));
+
+        assertTrue(t.blockCount() > 1, "24 KiB danych nie miesci sie w jednym 4 KiB bloku");
+        assertEquals(t.blockCount(), SSTable.open(dir.resolve("t.sst")).blockCount(),
+                "indeks odtworzony ze stopki bez zmian");
+    }
+
+    @Test
+    void everyKeyIsFoundThroughTheIndex(@TempDir Path dir) throws IOException {
+        multiBlockTable(dir.resolve("t.sst"));
+        SSTable t = SSTable.open(dir.resolve("t.sst")); // czytamy przez indeks z pliku, nie z pamieci writera
+
+        for (int i = 0; i < 200; i++) {
+            String key = String.format("klucz:%04d", i);
+            assertArrayEquals(b("v".repeat(120)), t.get(b(key)).orElseThrow().value(), key);
+        }
+        assertTrue(t.get(b("klucz:0200")).isEmpty(), "za maxKey");
+        assertTrue(t.get(b("klucz:")).isEmpty(), "przed minKey");
+    }
+
+    @Test
+    void missingKeyBetweenBlocksIsNotFound(@TempDir Path dir) throws IOException {
+        var mt = new MemTable();
+        for (int i = 0; i < 200; i += 2) { // same parzyste
+            mt.put(Record.value(b(String.format("klucz:%04d", i)), b("v".repeat(120)), i));
+        }
+        SSTable t = SSTable.open(SSTable.write(dir.resolve("t.sst"), mt.snapshot()).path());
+
+        for (int i = 1; i < 200; i += 2) { // pytamy o nieparzyste
+            String key = String.format("klucz:%04d", i);
+            assertTrue(t.get(b(key)).isEmpty(), key + " nie istnieje");
+        }
+    }
+
+    @Test
+    void indexSurvivesCompaction(@TempDir Path dir) throws IOException {
+        SSTable older = multiBlockTable(dir.resolve("0.sst"));
+        var mt = new MemTable();
+        mt.put(Record.value(b("klucz:0000"), b("nadpisane"), 1000));
+        SSTable newer = SSTable.write(dir.resolve("1.sst"), mt.snapshot());
+
+        SSTable merged = SSTable.compact(dir.resolve("2.sst"), List.of(older, newer), true).orElseThrow();
+        SSTable reopened = SSTable.open(merged.path());
+
+        assertTrue(reopened.blockCount() > 1, "scalona tabela tez ma indeks");
+        assertEquals(200, reopened.entryCount());
+        assertArrayEquals(b("nadpisane"), reopened.get(b("klucz:0000")).orElseThrow().value());
+        assertArrayEquals(b("v".repeat(120)), reopened.get(b("klucz:0199")).orElseThrow().value());
+    }
+
+    @Test
+    void bloomRejectsMissingKeysWithoutTouchingDisk(@TempDir Path dir) throws IOException {
+        multiBlockTable(dir.resolve("t.sst"));
+        SSTable t = SSTable.open(dir.resolve("t.sst"));
+
+        int survived = 0;
+        for (int i = 0; i < 1000; i++) {
+            // Klucze w zakresie minKey..maxKey, wiec zakres ich nie odsieje — robi to filtr.
+            if (t.mightContain(b(String.format("klucz:%04d-x", i)))) survived++;
+        }
+        assertTrue(survived < 100, "filtr przepuscil " + survived + "/1000 nieistniejacych kluczy");
+    }
+
+    @Test
+    void oldFormatVersionIsRejected(@TempDir Path dir) throws IOException {
+        Path file = dir.resolve("t.sst");
+        writeTable(file, Record.value(b("k"), b("v"), 0));
+
+        byte[] raw = Files.readAllBytes(file);
+        raw[SSTable.MAGIC.length] = 1; // plik z M2: dane bez indeksu i filtra
+        Files.write(file, raw);
+
+        IOException e = assertThrows(IOException.class, () -> SSTable.open(file));
+        assertTrue(e.getMessage().contains("wersja"), e.getMessage());
     }
 
     @Test

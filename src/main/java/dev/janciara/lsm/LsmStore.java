@@ -10,7 +10,7 @@ import java.util.List;
 import java.util.Optional;
 
 /**
- * Implementacja {@link KVStore} (M3): WAL + memtable + niemutowalne SSTable + scalanie tabel.
+ * Implementacja {@link KVStore} (M4): WAL + memtable + niemutowalne SSTable + scalanie tabel.
  *
  * <p><b>Sciezka zapisu.</b> Kazdy {@code put}/{@code delete} najpierw dopisuje rekord do
  * {@link Wal} (trwalosc), a dopiero potem uwidacznia go w {@link MemTable} (widocznosc). Gdy
@@ -18,7 +18,9 @@ import java.util.Optional;
  * startuje pusta, a WAL jest zerowany.
  *
  * <p><b>Sciezka odczytu</b> idzie od najswiezszej warstwy do najstarszej: memtable, potem SSTable
- * od najnowszej do najstarszej. Pierwsze trafienie wygrywa — nie trzeba porownywac {@code seqNo},
+ * od najnowszej do najstarszej. Tabela, ktora klucza nie ma, odpowiada zwykle bez czytania danych —
+ * odsiewa ja zakres kluczy albo filtr Blooma ({@link SSTable#mightContain}). Pierwsze trafienie
+ * wygrywa — nie trzeba porownywac {@code seqNo},
  * bo kazdy zrzut zawiera rekordy nowsze niz wszystko, co zrzucono wczesniej. Znaleziony rekord
  * moze byc tombstone; wtedy klucz jest dla swiata usuniety, mimo ze starsza tabela ma dla niego
  * wartosc. To wlasnie dlatego usuniecie moze byc zapisem.

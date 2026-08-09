@@ -3,8 +3,8 @@
 Mini-baza klucz-wartosc na architekturze **LSM-tree**, pisana od zera w Javie 21.
 Bez bibliotek bazodanowych — sens projektu to zaimplementowac silnik samodzielnie.
 
-> Status: **M3** — WAL + memtable + SSTable + scalanie tabel (odzysk miejsca).
-> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · M4 bloom+index · M5 benchmarki.
+> Status: **M4** — WAL + memtable + SSTable + scalanie + indeks blokowy i filtr Blooma.
+> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · ~~M4 bloom+index~~ · M5 benchmarki.
 
 ## Build & test
 ```bash
@@ -72,16 +72,35 @@ Liczby kodowane jako unsigned LEB128 varint (jak w LevelDB / Protobuf).
 ## Format SSTable
 ```
 naglowek:    "LSMT" | wersja(1B)
-dane:        record[entryCount]     — klucze scisle rosnace (unsigned)
+dane:        record[entryCount]     — klucze scisle rosnace (unsigned), bloki po ~4 KiB
+indeks:      uvarint(blockCount) | { blob(pierwszy klucz bloku) | uvarint(offset) }*
+bloom:       uvarint(bity) | uvarint(k) | uvarint(slowa) | long[]
 stopka:      uvarint(entryCount) | uvarint(maxSeqNo) | blob(minKey) | blob(maxKey)
+             | uvarint(offset indeksu)
 zakonczenie: int32BE(dlugosc stopki) | "LSMT"
 ```
 Stopka jest na koncu, bo metadane sa znane dopiero po przejsciu wszystkich rekordow; stale
 8 bajtow zakonczenia pozwala ja odnalezc, a powtorzony magic wykrywa uciety plik. Zapis idzie
 przez `.tmp` + fsync + atomowy rename, wiec czytelnik nigdy nie widzi polowicznej tabeli.
 
-Wyszukiwanie w M2 jest liniowe; odsiewaja tylko `minKey`/`maxKey` ze stopki i wczesne przerwanie
-skanu po minieciu klucza. Indeks blokowy i filtr Blooma dochodza w M4.
+## Sciezka odczytu punktowego
+
+Kazda tabela odsiewa pytanie trzema sitami, zanim ruszy dysk z danymi:
+
+| sito | koszt | co odrzuca |
+|---|---|---|
+| zakres `minKey`/`maxKey` ze stopki | 2 porownania | klucze spoza tabeli |
+| filtr Blooma (w pamieci) | 7 operacji na bitach | ~99% chybien w zakresie |
+| indeks blokowy (w pamieci) | wyszukiwanie binarne | wszystkie bloki poza jednym |
+
+Dopiero potem czytany jest **jeden blok** (~4 KiB), a nie caly plik. Indeks i filtr sa male, wiec
+`SSTable.open` wczytuje je raz i trzyma w pamieci. Filtr ma 10 bitow na klucz i `k = 10·ln2 ≈ 7`
+funkcji mieszajacych, liczonych podwojnym haszowaniem (`h_i = h1 + i·h2`, Kirsch-Mitzenmacher) —
+jeden hash FNV-1a zamiast siedmiu niezaleznych. Odpowiedz „nie ma" jest pewna, „moze byc" wymaga
+sprawdzenia w pliku; falszywych negatywow filtr nie produkuje z konstrukcji.
+
+Ma to znaczenie glownie dla **chybionych odczytow**: klucz, ktorego nie ma, musialby inaczej
+odwiedzic kazda tabele po kolei.
 
 ## References
 - DDIA (Kleppmann), rozdz. 3 — Storage and Retrieval
