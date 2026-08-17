@@ -3,9 +3,6 @@
 A miniature key-value store built on the **LSM-tree** architecture, written from scratch in Java 21.
 No database libraries — the whole point of the project is to implement the engine myself.
 
-> Status: **M5** — complete LSM engine with benchmarks.
-> Roadmap: ~~M1 memtable+WAL~~ · ~~M2 SSTable~~ · ~~M3 compaction~~ · ~~M4 bloom+index~~ · ~~M5 benchmarks~~.
-
 ## Build & test
 ```bash
 ./gradlew build      # compile + tests
